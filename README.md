@@ -42,6 +42,12 @@ explain a refiner's stock return, and can the gap between the actual return and 
 | PSX | 2012 | -0.01 | -0.20 |
 | **Average** | | **-0.20** | **0.21** |
 
+![VLO: baseline vs regime filter](results/charts/20_base_markov_flip.png)
+
+![Sharpe by stock](results/charts/30_all_sharpe.png)
+
+![Return by calendar year](results/charts/34_all_years.png)
+
 ## What I learned
 
 - **The raw fundamental signal is VLO-specific.** On peers it was flat to negative. For DINO and PBF the residual was
