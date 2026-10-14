@@ -1,0 +1,2279 @@
+---
+title: "Refining Fundamentals → Refiner Equity Returns"
+subtitle: "Walk-forward nowcast with a Markov regime filter, tested on US refiners"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M')`"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float: true
+    code_folding: hide
+    df_print: kable
+---
+
+A walk-forward nowcast of a refiner's monthly stock return from monthly refining fundamentals (crack spreads, crude
+differentials, product prices, inventories, demand). Each month the model selects and calibrates its variables on past data
+only, trades the residual (actual minus nowcast return), and a 3-state Markov regime filter decides when to trade with or
+against the signal. With `RUN_ALL = TRUE` one render runs the main stock and every peer with the same settings and ends with a
+comparison of all stocks (section 13). Data files are not included; see `data/README.md` for the expected layout.
+
+```{r setup, include=FALSE}
+pkgs <- c("readxl", "openxlsx", "matrixStats", "ggplot2", "scales", "knitr")
+missing_pkgs <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs)) install.packages(missing_pkgs, repos = "https://cloud.r-project.org")
+invisible(lapply(pkgs, library, character.only = TRUE))
+library(parallel)
+HAS_RAGG <- requireNamespace("ragg", quietly = TRUE)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 5.5,
+                      fig.retina = 2, dev = if (HAS_RAGG) "ragg_png" else "png")
+if (nzchar(Sys.getenv("MR_CHILD_STOCK"))) knitr::opts_chunk$set(error = TRUE)   # peer run: a chart that fails (e.g. too few years) does not stop the report
+```
+
+# 1. Configuration
+
+All settings are in this chunk. Run with `QUICK_MODE <- TRUE` first, then `FALSE` for the full run.
+
+**How the model works (overview):**
+
+- **Variable scores:** every candidate variable is scored monthly on significance (p-value), stability of its R² and its own out-of-sample R², each standardised over a rolling window; the weights of the three scores are calibrated.
+- **Selection and nowcast:** the top-ranked variables (limited by a correlation cap `Corr_t` and `VIF_MAX`) form the nowcast for the trade month; with `COMBINE_VARS = "univariate"` the forecast averages one-variable regressions.
+- **Calibration:** windows, number of variables, `Corr_t` and score weights are calibrated every month on the out-of-sample R² of past test windows (SPSA optimiser, warm start); `SMOOTH_TABLE` sets how each calibrated value is smoothed and the range it may take. With `OWN_START = TRUE` every stock first searches its own starting point, using data up to that month only.
+- **Trading:** a trade opens when the residual exceeds `Min_Res` × its standard deviation; take-profit and stop-loss at 1 × |residual|, holding up to `MAX_HOLD_M` months in overlapping sleeves, 10 bps per side.
+- **Validation strategies:** baseline and four variants that re-check the calibrated parameters on a later validation window ((a) choose, (b) gate, (c) both, (d) switch).
+- **Markov regime filter (`MK_METHOD = "hmm3b"`):** a 3-state hidden Markov model on the stock's return deviation, the model's variance ratio and the slope of its OOS R², fitted monthly on past data only. "Flip" reverses the trade in the low state; "graded" uses an ensemble of fits (`MK_ENS_WINDOWS`). Every strategy × Markov rule is reported in one grid; `COMBINED_STRATEGY` + `COMBINED_MARKOV` is the headline model.
+- **No lookahead:** every window, score, calibration and regime fit at month *t* uses data up to *t* only (checked in section 7).
+
+```{r config}
+QUICK_MODE <- TRUE   # TRUE for the first check run, then FALSE for the full run
+
+# ---- trading ------------------------------------------------------------------
+ENTRY_DAY     <- 0        # 0 = close of the signal month's last trading day
+                          # 1 / 2 / 3 = close of the 1st / 2nd / 3rd trading day of the next month
+COST_PER_SIDE <- 0.0010   # 10 bps per side, charged on changes in net exposure
+MAX_HOLD_M    <- 6        # maximum holding period (months) = number of sleeves
+
+# ---- model windows ---------------------------------------------------------------
+TRAIN_WIN_STEP <- 6       # grid step of the training window (its range is in the parameter table, row Train_Win)
+TEST_WIN_STEP  <- 4       # grid step of the test window (range: row Test_Win)
+TRAIN_PER_VAR   <- 12     # Train_Win >= 12 x n (with COMBINE_VARS = "univariate" every regression has ONE variable, so the
+                          #   12:1 rule then applies per regression and does not cap n; the n row of the table is the only cap)
+TEST_PER_VAR    <- 0      # Test_Win  >= 8 x n when 8; 0 = test ratio off (the test window does not limit n)
+WINDOW_SCORE_MONTHS <- 6  # screen: a window pair is scored by its OOS R2 averaged over the last 6 months
+WINDOW_UPDATE <- "monthly" # "monthly" = window pair re-chosen every month; "january" = once a year (old behaviour)
+WINDOW_TOP_K  <- 1         # top-K pairs from the screen get a full parameter calibration (plus the current pair);
+                           # the pair with the best calibrated OOS R2 is used. 1 = screen only.
+TEST_INCLUDES_TRADE_MONTH <- FALSE  # FALSE: calibration test window ends at month t-1 and month t is
+                                     #        priced as the first month after it (recommended)
+                                     # TRUE:  month t is the last month of the test window
+
+# ---- trade rules (chosen after the model) -----------------------------------------
+FIXED_T     <- 1.0                          # TP = 1 x |residual| (fixed, not calibrated)
+FIXED_S     <- 1.0                          # SL = 1 x |residual| (fixed, not calibrated)
+T_GRID      <- FIXED_T; S_GRID <- FIXED_S   # single values: the grid search below only varies Min_Res
+MINRES_GRID <- seq(0.00, 0.60, by = 0.05)   # ONLY calibrated trade rule: trade if |residual| > Min_Res x SD(test residuals)
+MIN_SIGNALS_FOR_TRADE_CALIB <- 6            # fewer past signals in the test window -> defaults below
+DEFAULT_TRADE_RULES <- c(t = FIXED_T, s = FIXED_S, min_res = 0.0)
+
+# ---- smoothing ---------------------------------------------------------------------------------------------------
+SMOOTHING <- "average"   # "average" = each parameter smoothed as set in the parameter table below; "none" = all raw
+WARM_START <- TRUE   # FALSE = main start is the default point (last month's result is still added as an extra start)
+OWN_START  <- TRUE   # TRUE = every stock (VLO too) finds its OWN starting parameters: at its first month with enough data, OWN_START_DRAWS
+                     #   random parameter sets (anywhere in the table's ranges) plus the default are scored, and the best
+                     #   OWN_START_TOP are optimised; the winner replaces the default start (Regr 36, Z 30, Train_MO 24, Test_MO 9,
+                     #   n 5, Corr_t 0.7, equal weights). Uses data up to that month only, and the backtest starts at that month.
+                     #   FALSE = default start for every stock.
+OWN_START_DRAWS <- 40; OWN_START_TOP <- 4
+                          # TRUE  = main start is last month's calibration with a narrower spread
+# ---- PARAMETER TABLE: one row per parameter / window / weight. Edit it here. -----------------------------------
+#   method, months = smoothing of the value used each month:
+#       "none" = raw calibrated value; "ema" = exponential average (months = EMA length);
+#       "mean", "median", "mode", "midrange", "midhinge" = over the last `months` raw values (Inf or NA = all history)
+#   min, max      = range the calibration may choose from (NA = no limit / default):
+#       Regr_Win, Z_Win, Train_MO, Test_MO, Train_Win, Test_Win in months; n = number of variables;
+#       Corr_t and the weights a, d, f between 0 and 1 (weights are shares that sum to 1); Min_Res within its grid (0-0.6)
+#   Every parameter, window and weight is set here and nowhere else. A calibrated parameter without a row is used raw.
+#   Rows for parameters in FIXED_PARAMS (or weights not in WEIGHTS) have no effect.
+SMOOTH_TABLE <- read.table(header = TRUE, stringsAsFactors = FALSE, text = "
+  name       method   months  min   max
+  Regr_Win   midrange Inf     20    100
+  Z_Win      midrange Inf     20    100
+  Train_MO   midrange Inf     12    100
+  Test_MO    midrange Inf     6     100
+  n          midrange Inf     5     8
+  Corr_t     midrange Inf     0.1   1
+  a          ema      18      0     1
+  d          ema      18      0     1
+  f          ema      18      0     1
+  Min_Res    ema      18      0     0.6
+  Train_Win  midrange Inf     60    120
+  Test_Win   midrange Inf     24    24
+")
+
+# ---- forecast shrinkage and combination (raise OOS R2 by cutting forecast variance) --------------
+# All three apply inside the nowcast itself, so calibration, validation, the Markov inputs and the trades all use them.
+SHRINK <- 1   # fitted value = training mean + SHRINK x (model forecast - training mean)
+                          #   1 = off (full model forecast); 0.5 = half-way to the historical mean; 0 = historical mean only
+                          #   (shrinking towards the mean benchmark is what the OOS R2 rewards for over-confident forecasts)
+COMBINE_VARS <- "univariate"   # "none"       = one multiple regression on the selected variables (previous behaviour)
+                          # "univariate" = equal-weight average of one-variable regressions, one per selected variable
+                          #                (Rapach, Strauss & Zhou 2010 combination forecast)
+                          # "mix"        = half the multiple regression + half the univariate average
+UNIVARIATE_FIX_N <- FALSE  # with COMBINE_VARS = "univariate", n is calibrated (removed from FIXED_PARAMS); TRUE = keep n fixed
+COMBINE_TRAIN <- 0   # average the forecast over training windows within +/- COMBINE_TRAIN months of the chosen one,
+                          #   on the TRAIN_WIN_STEP grid and inside TRAIN_WIN_RANGE (same variables, same test window)
+                          #   0 = off; 12 = up to 5 windows (step 6); Inf = every training length in the range
+                          #   (Pesaran & Pick 2011: combining across estimation windows)
+
+# ---- data and output ----------------------------------------------------------------
+MIN_OBS_FRAC <- 0.80; LOGZ_EPS <- 0.01; SEED <- 20260926
+PROJECT_DIR <- local({ f <- tryCatch(knitr::current_input(dir = TRUE), error = function(e) NULL)
+  if (is.null(f)) getwd() else dirname(normalizePath(f)) })                  # folder of this file
+DATA_DIR  <- file.path(PROJECT_DIR, "data")      # input files (not included in the repository)
+RESULTS_DIR <- file.path(PROJECT_DIR, "results") # output folders are created here
+DATA_FILE <- "fundamentals_monthly.xlsx"   # monthly data: col 1 = month, col 2 = main stock's monthly return, then one column per variable
+# ---- which stock -----------------------------------------------------------------------------
+STOCK      <- "VLO"            # main stock of this render: "VLO" or a peer name from PEER_COLS
+DAILY_FILE <- "main_stock_daily.xlsx"  # main stock's daily returns (column 1 = date, column 2 = daily return)
+# Peers: daily returns of other companies in ONE file in DATA_DIR, sheet "DailyChanges": Date + one column per company.
+PEER_FILE  <- "peers_daily.xlsx"
+PEER_COLS  <- c(DINO = "HFSinclair", DK = "Delek", CVI = "CvrEnerg", MPC = "Marathon", PBF = "PBFEnergy", PSX = "Philips66",
+                SUN = "Sunoco")   # ticker = column name in PEER_FILE; a new company = one more entry here
+# ---- run all stocks in one render ---------------------------------------------------------------
+RUN_ALL          <- TRUE       # TRUE = run STOCK, then every stock in RUN_ALL_STOCKS with these same settings, and add
+                               #   section 13 comparing them all; FALSE = STOCK only
+RUN_ALL_STOCKS   <- names(PEER_COLS)                       # peers to run, in this order; or a subset, e.g. c("DK", "CVI")
+RUN_ALL_PARALLEL <- 1          # peer runs at the same time: 1 = one after another (~1 h each); 2 only on 8+ cores
+CHILD <- Sys.getenv("MR_CHILD_STOCK")                       # set only inside a peer run started by RUN_ALL (do not edit)
+if (nzchar(CHILD)) { STOCK <- CHILD; RUN_ALL <- FALSE }
+if (STOCK %in% names(PEER_COLS)) DAILY_FILE <- PEER_FILE
+Y_FROM_DAILY <- STOCK != "VLO" # TRUE: the monthly return to explain is compounded from the stock's daily returns (column 2 of
+                               #   DATA_FILE is ignored), the own-return variables "StockReturns -k" and "AVGRETk (-j)" are rebuilt
+                               #   from this stock's returns, and "Beta" columns (VLO-specific) are dropped. So one monthly data file serves all.
+# History test: ignore a stock's returns before a month, as if it had listed then (the market variables keep their full
+# history, exactly like a stock that listed late). Results go to a separate folder ending "_from<month>".
+DATA_START <- c()              # e.g. c(VLO = "2012-04") = VLO with the same history as PSX; c() = full history for every stock
+RUN_TAG    <- ""          # optional label added to every output folder, e.g. "seed2"
+ds_of <- function(s) if (length(DATA_START) && s %in% names(DATA_START) && !is.na(DATA_START[[s]])) as.Date(paste0(DATA_START[[s]], "-01")) else as.Date(NA)
+DS <- ds_of(STOCK)
+out_dir_for <- function(s) file.path(RESULTS_DIR, paste0("MeanReversion_Results_v3", if (s != "VLO") paste0("_", s) else "",
+                                                                          if (nzchar(RUN_TAG)) paste0("_", RUN_TAG) else "",
+                                                                          if (!is.na(ds_of(s))) paste0("_from", format(ds_of(s), "%Y-%m")) else ""))
+OUT_DIR  <- out_dir_for(STOCK)
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+N_CORES  <- max(1L, parallel::detectCores() - 1L)
+
+# ---- optimiser budget ----------------------------------------------------------------
+INFEAS <- -1000           # objective for infeasible parameters (fix 2): always below any real OOS R2
+POLISH_ROUNDS <- 0   # local polish passes after SPSA (fix 4); 0 = off
+# Score weights used in the variable score (calibrated monthly). Available: c("a","b","c","d","e","f","g").
+#   a = significance (p-value), d = stability of R2, f = per-variable out-of-sample R2
+WEIGHTS <- c("a", "d", "f")
+# How the p-value enters term a (and c):
+#   "loglog" = log(1 + (-log p)): every p-value keeps a distinct value, smaller p scores higher, no explosion near p = 0
+#   "raw"    = -log(p): the original term (up to ~690 near p = 0)
+#   "rank"   = each month's percentile rank of -log(p) across all variables (0-1)
+P_TRANSFORM <- "loglog"
+# Weight mode: "simplex" = weights are non-negative shares that sum to 1 (no sign flips, no scale drift);
+#              "free"    = unconstrained weights (old behaviour, can be negative and drift in size)
+WEIGHT_MODE <- "simplex"
+# Economic core: variables ALWAYS in the regression (exact column names in DATA_FILE). They count towards n; the selection
+# fills the remaining slots as usual (Corr_t / VIF checked against them). A forced variable is skipped in a month where it is
+# missing or has too little history in the training window. character(0) = no forced variables.
+FORCE_VARS <- character(0)   # e.g. c("MOCHNG crck"): monthly change of the crack spread, the most stable driver in the data
+# Reward steady strength over recent, noisy strength in the variable ranking (both use months up to the end of training only):
+SCORE_AVG_MONTHS <- 1   # rank variables by their score AVERAGED over the last SCORE_AVG_MONTHS months (1 = this month only, as before);
+                          #   e.g. 12: a variable must have scored well for a year, not just in the latest window
+SIGN_MIN <- 0   # a candidate is dropped unless its coefficient had the same sign as now in at least this share of the last
+                          #   SIGN_MONTHS months (0 = off; e.g. 0.8). Removes variables whose relationship keeps flipping
+SIGN_MONTHS <- 24
+P_MAX <- 1   # a candidate is dropped unless its own one-variable regression on VLO (over Regr_Win months, ending at the
+                          #   end of the training window) has p-value < P_MAX (1 = off; e.g. 0.1). Forced variables are exempt.
+                          #   Months where fewer than n candidates pass simply use fewer variables.
+# Parameters held FIXED (not calibrated). Remove an entry to let the optimiser calibrate it again.
+FIXED_PARAMS <- list()
+POLISH_PARAMS <- c("n", "Corr_t", "Regr_Win", "Z_Win", "Train_MO", "Test_MO", WEIGHTS)   # fixed ones are skipped automatically
+# Multi-window calibration objective: each parameter set is scored by its OOS R2 averaged over OBJ_WINDOWS
+# consecutive, non-overlapping past test windows (each with its own training window before it).
+# 1 = single window (old behaviour). Rewards parameters that keep working across periods (less winner's curse).
+OBJ_WINDOWS       <- 1   # with VALIDATION_MODE the 12-month validation does this job more directly
+OBJ_RECENT_WEIGHT <- 1    # weight of the most recent window relative to the older ones (1 = equal, 2 = counts double)
+# Validation ("future") stage: train -> 24-month test (calibration) -> VAL_WIN-month validation -> trade month.
+# Four strategies run side by side: Baseline (test-window winner), (a) choose the candidate that holds up best on
+# validation, (b) trade the winner only if its validation OOS R2 > VAL_GATE, (c) choose + gate.
+# The trade-month residual uses the validated parameters with variables / coefficients re-estimated on the training
+# window just before the validation window. All stages end at or before the trade month (no lookahead).
+VALIDATION_MODE <- TRUE   # strategies reported: Baseline, (a) choose, (b) gate, (c) choose + gate,
+                          # (d) switch = (a) when the winner's validation OOS R2 < 0, Baseline when it is >= 0
+# ---- diagnostics: collinearity, heteroskedasticity, linearity --------------------
+VIF_MAX        <- 5           # a variable is added only if its VIF against the ones already chosen is <= VIF_MAX (Inf = off)
+HETERO_DIAG    <- TRUE        # each month: Breusch-Pagan test (training window) + variance ratio (test / training residuals)
+TRANSFORM_MODE <- "report"   # "none"; "report" = rolling linearity check of the model used each month (report only, trades unchanged);
+                              # "adaptive" = the check is USED: each month, a selected variable whose signed log / signed sqrt raises
+                              #              the model's adjusted R2 by >= LIN_GAIN on the training window enters in that form
+                              #              (decided on training data only; applies to calibration, validation and trades)
+                              # "candidates" = signed-log and signed-sqrt versions added as extra candidate variables (check still runs)
+LIN_P    <- 0.05              # rolling check: significance level; the per-variable x^2 test uses LIN_P / (number of variables)
+LIN_GAIN <- 0.02              # rolling check: a transform counts as better when it raises the model's adjusted R2 by >= LIN_GAIN
+# ---- Markov states (binary, from the variance ratio and the OOS R2 of the model behind each trade) -----
+MARKOV_MODE <- TRUE   # fit the Markov regime model each month; Baseline, Markov skip and Markov flip are reported side by side
+MK_METHOD   <- "hmm3b"   # "hmm3b" = 3-state Markov model on VLO's return deviation (this month vs the past MK_DEV_MONTHS),
+                           #           the variance ratio and the average slope of the validation OOS R2 over MK_B_SLOPE_MONTHS;
+                           #           states named by variance ratio: low / mid / high; MK_BAD_REGIME_B is state 0
+                           # "hmm3" = 3-state Markov model on variance ratio, VLO volatility and the slope of the validation OOS R2;
+                           #          the state whose past CLOSED trades did worst is state 0 (skipped / flipped)
+                           # "threshold" = state 0 when this month's combined score is below the MK_QUANTILE of its own history
+                           #               (fast: reacts every month); "hmm" = 2-state Markov model on the score (slow, persistent regimes)
+MK_QUANTILE <- 0.5       # threshold method: quantile of the score's history below which the state is 0 (0.5 = median, 1/3 = lowest third)
+MK_ENTER    <- 0.6       # hmm method: switch to state 0 ("bad") when P(bad) > MK_ENTER ...
+MK_EXIT     <- 0.4       # ... and back to state 1 only when P(bad) < MK_EXIT (hysteresis)
+MK_MIN_HIST <- 12   # months of inputs needed before the Markov model is used (state 1 before that)
+MK_ITERS    <- 50        # EM iterations per monthly fit
+MK_HIST_WIN <- 100   # months of history the state is judged against (Inf = all history so far; e.g. 120 = last 10 years)
+MK_VOL_MONTHS   <- 3     # hmm3: VLO realised volatility over the last 3 months (daily returns up to the decision month's close)
+MK_SLOPE_MONTHS <- 6     # hmm3: slope of the validation OOS R2 over the last 6 months (improving vs deteriorating model)
+MK_MIN_TRADES   <- 8     # hmm3: a state is ranked only once it has at least 8 closed trades; until 2 states qualify, everything trades
+MK_BAD_REGIME   <- "calm" # hmm3: which regime is state 0. "calm" / "normal" / "turbulent" (or several, e.g. c("calm", "turbulent")) =
+                          #       fixed in advance (calm = low volatility was the weak regime in every run so far);
+                          #       "learned" = the regime whose past closed trades did worst (reacts to noise: not recommended)
+MK_INPUT1 <- "retdev"   # hmm3b: first Markov input
+                          #   "reversion" = reversion efficacy: correlation between the model's residual at each of the last
+                          #                 MK_DEV_MONTHS signals and VLO's return in the FOLLOWING month (only signals whose next
+                          #                 month is already over). Negative = mispricings closed (mean reversion works);
+                          #                 near 0 / positive = they persisted (the regime where flipping pays)
+                          #   "retdev"    = VLO's return this month vs the past MK_DEV_MONTHS months (z-score; previous input)
+MK_DEV_MONTHS     <- 24   # hmm3b: window of the first input (signals for "reversion", months for "retdev")
+MK_B_SLOPE_MONTHS <- 24   # hmm3b: slope of the validation OOS R2 over the last 24 months
+MK_BAD_REGIME_B   <- "low" # hmm3b: state 0 regime(s): "low" / "mid" / "high" variance ratio (or "learned")
+# hmm3b "graded" rule: the 3-state model is fitted with each input window below (return deviation and R2 slope);
+#   FLIP  if at least MK_FLIP_VOTES fits say "low" (and, if MK_USE_CALM, volatility is calm);
+#   SKIP  if at least MK_SKIP_VOTES fits say "low" (or, if MK_USE_CALM, volatility is calm) but the flip condition fails;
+#   TRADE otherwise.
+MK_ENS_WINDOWS <- c(12, 24, 36)  # input windows of the ensemble fits (months)
+MK_FLIP_VOTES  <- 1   # fits (of length(MK_ENS_WINDOWS)) that must say "low" to flip; 2 of 3 = majority
+MK_SKIP_VOTES  <- Inf            # fits that must say "low" to skip when not flipping (Inf = never skip; e.g. 1)
+MK_USE_CALM    <- FALSE          # TRUE = flipping also requires calm volatility, and calm alone skips
+                                 #   (calm months were profitable before 2020 in the latest run, so off by default)
+MK_CALM_Q      <- 1/3            # calm = VLO's MK_VOL_MONTHS-month volatility in the lowest third of its own history up to the month
+MK_BAD_BELOW    <- 0     # hmm3, "learned" only: the worst regime becomes state 0 only if its closed trades averaged BELOW this;
+                         #       if every regime is profitable, nothing is skipped or flipped
+VAL_WIN         <- 12
+# ---- combined model: one validation strategy + one Markov rule, reported as the headline result -------------
+COMBINED_STRATEGY <- "base"   # "base", "a", "b", "c" or "d". Validation now only feeds the Markov state (R2 slope);
+                             # the validation strategies are still reported in the grid for reference
+COMBINED_MARKOV   <- "graded"   # "none", "skip", "flip" or "graded" (ensemble + calm volatility, see MK_ENS_WINDOWS)
+VAL_GATE        <- 0
+if (QUICK_MODE) {
+  CAL <- list(starts = 2, iters = 15, n_pert = 1); TRAIN_WIN_STEP <- 12; TEST_WIN_STEP <- 8; WINDOW_SCORE_MONTHS <- 6
+  POLISH_ROUNDS <- min(POLISH_ROUNDS, 2); WINDOW_TOP_K <- min(WINDOW_TOP_K, 2)
+} else {
+  CAL <- list(starts = 6, iters = 60, n_pert = 2)
+}
+CHECKPOINT_EVERY <- 12
+NAG_MU <- 0.8; NAG_A0 <- 0.25; NAG_C0 <- 0.15; NAG_VMAX <- 1.0
+MEMO_CAP <- list(reg = 60, zreg = 120, oos = 60, zoos = 150)
+stopifnot("SMOOTHING must be 'average' or 'none'" = SMOOTHING %in% c("average", "none"))
+LAYER2 <- SMOOTHING == "average"
+# ---- calibration ranges: built-in defaults, then the parameter table ----
+PARAM_MIN <- c(Regr_Win = 5, Z_Win = 3, Train_MO = 5, Test_MO = 2)
+N_RANGE <- c(5, 8); TRAIN_WIN_RANGE <- c(60, 120); TEST_WIN_RANGE <- c(24, 24)
+# ---- calibration ranges from the parameter table ----
+trow <- function(nm) { r <- SMOOTH_TABLE[trimws(SMOOTH_TABLE$name) == nm, , drop = FALSE]
+  if (!nrow(r) || !all(c("min", "max") %in% names(r))) c(NA_real_, NA_real_) else as.numeric(unlist(r[1, c("min", "max")])) }
+PARAM_MAX <- c(Regr_Win = Inf, Z_Win = Inf, Train_MO = Inf, Test_MO = Inf)
+for (p in names(PARAM_MAX)) { r <- trow(p); if (!is.na(r[1])) PARAM_MIN[p] <- r[1]; if (!is.na(r[2])) PARAM_MAX[p] <- r[2] }
+r <- trow("n");         if (!is.na(r[1])) N_RANGE[1] <- r[1];         if (!is.na(r[2])) N_RANGE[2] <- r[2]
+r <- trow("Train_Win"); if (!is.na(r[1])) TRAIN_WIN_RANGE[1] <- r[1]; if (!is.na(r[2])) TRAIN_WIN_RANGE[2] <- r[2]
+r <- trow("Test_Win");  if (!is.na(r[1])) TEST_WIN_RANGE[1] <- r[1];  if (!is.na(r[2])) TEST_WIN_RANGE[2] <- r[2]
+r <- trow("Min_Res");   MINRES_GRID <- MINRES_GRID[MINRES_GRID >= (if (is.na(r[1])) -Inf else r[1] - 1e-9) & MINRES_GRID <= (if (is.na(r[2])) Inf else r[2] + 1e-9)]
+if (!length(MINRES_GRID)) stop("Parameter table: the Min_Res range leaves no value of the Min_Res grid (0, 0.05, ..., 0.60)")
+DEFAULT_TRADE_RULES["min_res"] <- min(max(DEFAULT_TRADE_RULES[["min_res"]], min(MINRES_GRID)), max(MINRES_GRID))
+CORR_RANGE <- { r <- trow("Corr_t"); c(if (is.na(r[1])) 0 else r[1], if (is.na(r[2])) 1 else r[2]) }
+W_RANGE <- t(vapply(letters[1:7], function(w) { r <- trow(w); c(if (is.na(r[1])) 0 else r[1], if (is.na(r[2])) 1 else r[2]) }, c(0, 0)))
+stopifnot("Parameter table: a min is above its max" = all(PARAM_MIN[names(PARAM_MAX)] <= PARAM_MAX) && N_RANGE[1] <= N_RANGE[2] &&
+            CORR_RANGE[1] <= CORR_RANGE[2] && all(W_RANGE[, 1] <= W_RANGE[, 2]))
+stopifnot("WINDOW_UPDATE must be 'monthly' or 'january'" = WINDOW_UPDATE %in% c("monthly", "january"),
+          "WINDOW_TOP_K must be >= 1" = WINDOW_TOP_K >= 1)
+# Minimum windows follow from the ratio rules, so every window pair can hold at least N_RANGE[1] variables
+# (n >= 5 -> Train_Win >= 60, Test_Win >= 40). Without this, short pairs would force n below the minimum.
+TRAIN_WIN_RANGE[1] <- max(TRAIN_WIN_RANGE[1], TRAIN_PER_VAR * if (identical(COMBINE_VARS, "univariate")) 1 else N_RANGE[1])
+# Univariate combination: the number of variables is calibrated (a fixed n would make the univariate n-range pointless).
+# Set UNIVARIATE_FIX_N <- TRUE to keep n from FIXED_PARAMS anyway. The other FIXED_PARAMS stay fixed either way.
+if (identical(COMBINE_VARS, "univariate") && "n" %in% names(FIXED_PARAMS) && !isTRUE(get0("UNIVARIATE_FIX_N"))) {
+  FIXED_PARAMS$n <- NULL
+  message("COMBINE_VARS = \"univariate\": n removed from FIXED_PARAMS and calibrated within N_RANGE = ", paste(N_RANGE, collapse = "-"))
+}
+TEST_WIN_RANGE[1]  <- max(TEST_WIN_RANGE[1],  TEST_PER_VAR  * N_RANGE[1])
+stopifnot("Window ranges too short for the minimum number of variables" =
+            TRAIN_WIN_RANGE[1] <= TRAIN_WIN_RANGE[2] && TEST_WIN_RANGE[1] <= TEST_WIN_RANGE[2])
+```
+
+# 2. Data
+
+```{r load-data}
+parse_ym <- function(x) {
+  if (inherits(x, c("Date", "POSIXct", "POSIXt"))) return(as.Date(format(as.Date(x), "%Y-%m-01")))
+  if (is.numeric(x)) return(as.Date(format(as.Date(x, origin = "1899-12-30"), "%Y-%m-01")))
+  mm <- regmatches(as.character(x), regexec("(\\d{4})\\s*[-/.]\\s*(\\d{1,2})", as.character(x)))
+  y <- as.integer(vapply(mm, function(v) if (length(v) == 3) v[2] else NA_character_, ""))
+  mo <- as.integer(vapply(mm, function(v) if (length(v) == 3) v[3] else NA_character_, ""))
+  as.Date(ifelse(is.na(y), NA, sprintf("%04d-%02d-01", y, mo)))
+}
+parse_num <- function(x) {
+  if (is.numeric(x)) return(as.numeric(x))
+  s <- trimws(as.character(x)); pct <- grepl("%", s)
+  v <- suppressWarnings(as.numeric(gsub("[%,\\s]", "", s))); ifelse(pct, v / 100, v)
+}
+raw_m <- readxl::read_excel(file.path(DATA_DIR, DATA_FILE), sheet = 1)
+dts <- parse_ym(raw_m[[1]]); stopifnot("Could not parse the Y/Mo column" = all(!is.na(dts)))
+o <- order(dts)
+MON <- list(dates = dts[o], y = parse_num(raw_m[[2]])[o],
+            X = as.matrix(as.data.frame(lapply(raw_m[-(1:2)], parse_num)))[o, , drop = FALSE])
+colnames(MON$X) <- names(raw_m)[-(1:2)]
+MON$X <- MON$X[, colSums(!is.na(MON$X)) > 0, drop = FALSE]
+if (STOCK %in% names(PEER_COLS)) {           # peer: its column of the DailyChanges sheet in PEER_FILE
+  raw_d <- readxl::read_excel(file.path(DATA_DIR, PEER_FILE), sheet = "DailyChanges", guess_max = 1e6)   # columns start blank before listing
+  if (!PEER_COLS[[STOCK]] %in% names(raw_d)) stop(sprintf("Column '%s' (for %s) not found in %s", PEER_COLS[[STOCK]], STOCK, PEER_FILE))
+  DAY <- data.frame(Date = as.Date(raw_d[[1]]), r = parse_num(raw_d[[PEER_COLS[[STOCK]]]]))
+  if (sum(is.finite(DAY$r)) < 250) stop(sprintf("%s: fewer than 250 daily returns read from %s", STOCK, PEER_FILE))
+} else {
+  raw_d <- readxl::read_excel(file.path(DATA_DIR, DAILY_FILE), sheet = 1)
+  DAY <- data.frame(Date = as.Date(raw_d[[1]]), r = parse_num(raw_d[[2]]))
+}
+DAY <- DAY[!is.na(DAY$Date), ]; DAY <- DAY[order(DAY$Date), ]
+lagv <- function(x, k) if (k == 0) x else c(rep(NA_real_, k), head(x, -k))
+rebuild_own <- function(X, y) {          # own-return variables from the stock's monthly returns y
+  cn <- colnames(X)
+  for (j in grep("^StockReturns\\s*-\\s*\\d+$", cn)) X[, j] <- lagv(y, as.integer(sub("^.*-\\s*", "", cn[j])))
+  for (j in grep("^AVGRET\\d+(\\s*-\\s*\\d+)?$", cn)) {          # AVGRETw = mean of the previous w months (current excluded)
+    w <- as.integer(sub("^AVGRET(\\d+).*$", "\\1", cn[j])); k <- if (grepl("-", cn[j])) as.integer(sub("^.*-\\s*", "", cn[j])) else 0L
+    base <- vapply(seq_along(y), function(t) if (t <= w) NA_real_ else mean(y[(t - w):(t - 1)]), 0)
+    X[, j] <- lagv(base, k)
+  }
+  X
+}
+if (Y_FROM_DAILY) {                     # monthly return of STOCK from its daily returns (months with < 10 daily returns -> missing)
+  ymd <- format(DAY$Date, "%Y-%m")
+  my <- tapply(DAY$r, ymd, function(r) if (sum(is.finite(r)) >= 10) prod(1 + r[is.finite(r)]) - 1 else NA_real_)
+  MON$y <- as.numeric(my[format(MON$dates, "%Y-%m")])
+  MON$X <- rebuild_own(MON$X, MON$y); cn <- colnames(MON$X)
+  dropb <- grep("^Beta", cn); if (length(dropb)) MON$X <- MON$X[, -dropb, drop = FALSE]
+  message(sprintf("%s: monthly returns from %s (%d months); own-return variables rebuilt; %d Beta columns dropped",
+                  STOCK, DAILY_FILE, sum(is.finite(MON$y)), length(dropb)))
+}
+if (!is.na(DS)) {                       # history test: the stock's returns before DS are treated as not existing
+  MON$y[MON$dates < DS] <- NA
+  Xr <- rebuild_own(MON$X, MON$y)                                    # own-return variables: blank wherever they would need
+  for (j in grep("^(StockReturns\\s*-\\s*\\d+|AVGRET\\d+(\\s*-\\s*\\d+)?)$", colnames(Xr))) MON$X[is.na(Xr[, j]), j] <- NA   # returns before DS
+  jb <- grep("^Beta", colnames(MON$X)); if (length(jb)) MON$X[MON$dates < DS, jb] <- NA
+  DAY$r[DAY$Date < DS] <- NA
+  message(sprintf("%s: returns before %s ignored (%d months left)", STOCK, format(DS, "%Y-%m"), sum(is.finite(MON$y))))
+}
+DAY$r[is.na(DAY$r)] <- 0
+stopifnot("Daily returns must be > -100%" = all(DAY$r > -1), "ENTRY_DAY must be 0-3" = ENTRY_DAY %in% 0:3)
+
+data.frame(Item = c("Calibration objective windows", "Score weights", "Fixed parameters", "Variables (n)", "Window ranges (train / test)", "Data file", "Months", "First / last month", "Variables", "Daily rows", "Entry", "Quick mode", "Smoothing",
+                    "Calibration test window", "Window pair update", "Window pairs fully calibrated", "TP / SL"),
+           Value = c(sprintf("%d past test windows (most recent weight %s)", OBJ_WINDOWS, OBJ_RECENT_WEIGHT),
+                     sprintf("%s (%s)", paste(WEIGHTS, collapse = ", "), WEIGHT_MODE),
+                     paste(sprintf("%s = %s", names(FIXED_PARAMS), unlist(FIXED_PARAMS)), collapse = "; "),
+                     paste(N_RANGE, collapse = " to "), sprintf("%d-%d / %d-%d months", TRAIN_WIN_RANGE[1], TRAIN_WIN_RANGE[2],
+                     TEST_WIN_RANGE[1], TEST_WIN_RANGE[2]), DATA_FILE, length(MON$y), paste(format(range(MON$dates), "%Y-%m"), collapse = " / "), ncol(MON$X), nrow(DAY),
+                     if (ENTRY_DAY == 0) "close of signal month" else sprintf("close of trading day %d of next month", ENTRY_DAY),
+                     QUICK_MODE, SMOOTHING, if (TEST_INCLUDES_TRADE_MONTH) "ends at trade month t" else "ends at t-1",
+                     WINDOW_UPDATE, sprintf("top %d from screen + current pair", WINDOW_TOP_K),
+                     sprintf("fixed at %.2f / %.2f x |residual|", FIXED_T, FIXED_S)))
+```
+
+```{r data-object}
+`%||%` <- function(a, b) if (is.null(a)) b else a
+cs0 <- function(A) rbind(0, matrixStats::colCumsums(A))
+rollC <- function(C0, W) { Tn <- nrow(C0) - 1L; out <- matrix(NA_real_, Tn, ncol(C0))
+  if (W >= 1 && W <= Tn) out[W:Tn, ] <- C0[(W + 1):(Tn + 1), , drop = FALSE] - C0[1:(Tn - W + 1), , drop = FALSE]; out }
+shiftR <- function(S, h) { Tn <- nrow(S); out <- matrix(NA_real_, Tn, ncol(S))
+  if (h < Tn) out[(h + 1):Tn, ] <- S[1:(Tn - h), , drop = FALSE]; out }
+first_valid <- function(S) { i <- max.col(t((!is.na(S)) * 1), ties.method = "first")
+  v <- S[cbind(i, seq_len(ncol(S)))]; v[is.na(v)] <- 0; v }
+add_months <- function(d, k) {
+  lt <- as.POSIXlt(d); y <- lt$year + 1900; mo <- lt$mon + k; y2 <- y + mo %/% 12; mo2 <- mo %% 12
+  nxt <- as.Date(sprintf("%04d-%02d-01", y2 + (mo2 + 1) %/% 12, (mo2 + 1) %% 12 + 1))
+  as.Date(sprintf("%04d-%02d-%02d", y2, mo2 + 1, pmin(lt$mday, as.integer(format(nxt - 1, "%d")))))
+}
+new_memo <- function() { m <- new.env(); for (nm in names(MEMO_CAP)) { e <- new.env(); e$keys <- character(0)
+  e$cap <- MEMO_CAP[[nm]]; assign(nm, e, envir = m) }; m }
+memo <- function(D, type, key, maker) {
+  e <- get(type, envir = D$memo); k <- paste(key, collapse = "_")
+  if (exists(k, envir = e, inherits = FALSE)) return(get(k, envir = e))
+  v <- maker(); assign(k, v, envir = e); e$keys <- c(e$keys, k)
+  if (length(e$keys) > e$cap) { rm(list = e$keys[1], envir = e); e$keys <- e$keys[-1] }
+  v
+}
+
+# Signed transforms, scaled by the EXPANDING median of |x| (row k only uses rows 1..k: no lookahead).
+exp_med_abs <- function(x) { out <- rep(NA_real_, length(x)); for (k in seq_along(x)) { v <- abs(x[1:k]); v <- v[is.finite(v) & v > 0]
+  if (length(v)) out[k] <- median(v) }; out }
+slog  <- function(x, sc) sign(x) * log1p(abs(x) / sc)
+ssqrt <- function(x, sc) sign(x) * sqrt(abs(x) / sc)
+add_transforms <- function(X) {
+  if (TRANSFORM_MODE != "candidates") return(X)
+  SC <- apply(X, 2, exp_med_abs)
+  XL <- slog(X, SC); XS <- ssqrt(X, SC)
+  colnames(XL) <- paste0(colnames(X), "__slog"); colnames(XS) <- paste0(colnames(X), "__ssqrt")
+  cbind(X, XL, XS)
+}
+make_data <- function(MON, DAY) {
+  X <- add_transforms(MON$X); y <- MON$y
+  X0 <- sweep(X, 2, first_valid(X)); M <- (!is.na(X0) & !is.na(y)) * 1
+  Xm <- X0; Xm[M == 0] <- 0; y0 <- ifelse(is.na(y), 0, y); Ym <- M * y0
+  D <- list(Tn = length(y), V = ncol(X), vars = colnames(X), dates = MON$dates, y = y, X = X,
+            C = list(M = cs0(M), X = cs0(Xm), Y = cs0(Ym), XX = cs0(Xm * Xm), YY = cs0(Ym * y0), XY = cs0(Xm * Ym)),
+            memo = new_memo())
+  dd <- DAY$Date; nd <- length(dd); day_ym <- format(dd, "%Y-%m"); mon_ym <- format(MON$dates, "%Y-%m")
+  D$first_day <- match(mon_ym, day_ym); D$last_day <- nd - match(mon_ym, rev(day_ym)) + 1
+  if (ENTRY_DAY == 0) D$entry_idx <- D$last_day else {
+    nxt <- format(add_months(MON$dates, 1), "%Y-%m"); f <- match(nxt, day_ym); cand <- f + ENTRY_DAY - 1
+    D$entry_idx <- ifelse(!is.na(cand) & cand <= nd & day_ym[pmin(cand, nd)] == nxt, cand, NA_integer_)
+  }
+  tgt <- add_months(dd, MAX_HOLD_M); D$mh_idx <- findInterval(tgt, dd); D$mh_full <- tgt <= dd[nd]
+  D$ddates <- dd; D$r <- DAY$r; D$L <- cumsum(log1p(DAY$r)); D$n_days <- nd
+  D
+}
+truncate_inputs <- function(MON, DAY, k) {
+  cut <- max(DAY$Date[format(DAY$Date, "%Y-%m") == format(MON$dates[k], "%Y-%m")])
+  list(MON = list(dates = MON$dates[1:k], y = MON$y[1:k], X = MON$X[1:k, , drop = FALSE]), DAY = DAY[DAY$Date <= cut, ])
+}
+D <- make_data(MON, DAY)
+if (length(setdiff(FORCE_VARS, D$vars))) warning("FORCE_VARS not found in ", DATA_FILE, " (ignored): ", paste(setdiff(FORCE_VARS, D$vars), collapse = ", "))
+```
+
+**Lookahead check.** Rolling statistics come from cumulative sums. Each row *k* only uses rows up to *k*. The entry day is always after the signal month's close.
+
+# 3. Variable statistics (Rules 2–6)
+
+Per-variable rolling regressions: p-value, adjusted R², coefficient, the standardised p-value −log(p), rolling z-scores, and the per-variable out-of-sample R² (`Train_MO`/`Test_MO`) with its z-score. All are computed in closed form from cumulative sums and stored for reuse.
+
+```{r sheets}
+reg_sheet <- function(D, W) memo(D, "reg", W, function() {
+  C <- D$C; n <- rollC(C$M, W); Sx <- rollC(C$X, W); Sy <- rollC(C$Y, W)
+  Sxx <- rollC(C$XX, W); Syy <- rollC(C$YY, W); Sxy <- rollC(C$XY, W)
+  Sxxc <- Sxx - Sx^2 / n; Syyc <- Syy - Sy^2 / n; Sxyc <- Sxy - Sx * Sy / n
+  ok <- !is.na(n) & n >= max(3, ceiling(MIN_OBS_FRAC * W)) & Sxxc > 1e-12 * (Sxx + 1e-300) & Syyc > 0
+  beta <- Sxyc / Sxxc; R2 <- pmin(pmax(Sxyc^2 / (Sxxc * Syyc), 0), 1); df <- n - 2
+  P <- suppressWarnings(2 * pt(-abs(beta / sqrt(pmax(Syyc - beta * Sxyc, 0) / df / Sxxc)), df))
+  Adj <- 1 - (1 - R2) * (n - 1) / df
+  P[!ok] <- NA; beta[!ok] <- NA; Adj[!ok] <- NA
+  Pstd <- -log(pmax(P, 1e-300))
+  Pstd <- switch(P_TRANSFORM,
+                 loglog = log1p(Pstd),                                                  # smooth compression, no cap
+                 rank   = t(apply(Pstd, 1, function(v) rank(v, na.last = "keep") / sum(!is.na(v)))),  # within-month percentile
+                 raw    = Pstd)
+  list(P = P, Pstd = Pstd, AdjR2 = Adj, Coef = beta)
+})
+z_roll <- function(S, Z) {
+  ok0 <- !is.na(S); Sc <- sweep(S, 2, first_valid(S)); Sc[!ok0] <- 0
+  n <- rollC(cs0(ok0 * 1), Z); s1 <- rollC(cs0(Sc), Z); s2 <- rollC(cs0(Sc^2), Z)
+  mu <- s1 / n; v <- (s2 - s1 * mu) / (n - 1); z <- suppressWarnings((Sc - mu) / sqrt(v))
+  z[!(ok0 & !is.na(n) & n >= max(3, ceiling(MIN_OBS_FRAC * Z)) & v > 1e-14)] <- NA; z
+}
+zreg_sheet <- function(D, W, Z) memo(D, "zreg", c(W, Z), function() {
+  R <- reg_sheet(D, W); list(zP = z_roll(R$Pstd, Z), zA = z_roll(R$AdjR2, Z), zC = z_roll(R$Coef, Z)) })
+oos_sheet <- function(D, Tr, Te) memo(D, "oos", c(Tr, Te), function() {
+  C <- D$C; tr <- function(nm) shiftR(rollC(C[[nm]], Tr), Te); te <- function(nm) rollC(C[[nm]], Te)
+  n1 <- tr("M"); x1 <- tr("X"); y1 <- tr("Y"); xx1 <- tr("XX"); xy1 <- tr("XY")
+  n2 <- te("M"); x2 <- te("X"); y2 <- te("Y"); xx2 <- te("XX"); yy2 <- te("YY"); xy2 <- te("XY")
+  Sxxc <- xx1 - x1^2 / n1; beta <- (xy1 - x1 * y1 / n1) / Sxxc; alpha <- y1 / n1 - beta * x1 / n1; ybar <- y1 / n1
+  SSE <- yy2 - 2 * alpha * y2 - 2 * beta * xy2 + alpha^2 * n2 + 2 * alpha * beta * x2 + beta^2 * xx2
+  SST <- yy2 - 2 * ybar * y2 + ybar^2 * n2; out <- 1 - SSE / SST
+  ok <- !is.na(n1) & !is.na(n2) & n1 >= max(3, ceiling(MIN_OBS_FRAC * Tr)) & n2 >= max(1, ceiling(MIN_OBS_FRAC * Te)) &
+        Sxxc > 1e-12 * (xx1 + 1e-300) & SST > 1e-14
+  out[!ok] <- NA; out
+})
+zoos_sheet <- function(D, Tr, Te, Z) memo(D, "zoos", c(Tr, Te, Z), function() z_roll(oos_sheet(D, Tr, Te), Z))
+```
+
+# 4. Scoring, selection and the nowcast model (Rule 7)
+
+$$\text{Score} = a\,p_{std} + d\,L(z_{\bar R^2}) + f\,R^2_{OOS},\quad p_{std} = \log(1 - \log p),\quad L(z) = -\log(|z| + 0.01)$$
+
+The weights in use are set by `WEIGHTS` (default a, d, f: significance, stability of R² and per-variable out-of-sample R²). With `P_TRANSFORM = "loglog"` (default), the significance term is p_std = log(1 + (−log p)): smaller p-values always score higher, but values near p = 0 no longer explode.
+
+For a given month *t* and window pair:
+
+- **Windows:**
+  - The **test window** is the `Test_Win` months ending at *t* − 1. With `TEST_INCLUDES_TRADE_MONTH = TRUE`, it ends at *t* instead.
+  - The **training window** is the `Train_Win` months just before the test window.
+- **Selection:** variables are chosen with the scores at the **end of the training window**. The top-ranked variables are taken in order, skipping any whose correlation with an already chosen one exceeds `Corr_t`, until `n` are chosen. `n` must stay between 3 and min(8, ⌊Train_Win/12⌋, ⌊Test_Win/8⌋).
+- **Model fit and objective:** the model is fitted on the training window and predicts every test month with the **training coefficients**. The objective is out-of-sample R² = 1 − SSE / SST, where SST uses the training mean as the benchmark.
+- **Trade month:** month *t* is priced with the same training coefficients (no refit). Its residual is actual − fitted, and the residual SD comes from the test months.
+- **Infeasible parameters** (not enough history, no variables, rank-deficient fit) score `INFEAS` = −1000, so they always lose to any real model.
+
+```{r model}
+W_TYPE <- if (WEIGHT_MODE == "simplex") "simplex" else "real"
+SPEC_ALL <- data.frame(name = c("Regr_Win", "Z_Win", "Train_MO", "Test_MO", WEIGHTS, "n", "Corr_t"),
+                   type = c(rep("int", 4), rep(W_TYPE, length(WEIGHTS)), "nint", "logit"),
+                   lo = c(unname(PARAM_MIN[c("Regr_Win", "Z_Win", "Train_MO", "Test_MO")]), rep(NA, length(WEIGHTS)), NA, NA),
+                   start = c(pmax(c(36, 12, 24, 6), unname(PARAM_MIN[c("Regr_Win", "Z_Win", "Train_MO", "Test_MO")]) * 1.5), rep(if (W_TYPE == "simplex") 1 / length(WEIGHTS) else 1, length(WEIGHTS)), 5, 0.7),
+                   stringsAsFactors = FALSE)
+SPEC <- SPEC_ALL[!SPEC_ALL$name %in% names(FIXED_PARAMS), , drop = FALSE]      # only these are calibrated
+POLISH_PARAMS <- intersect(POLISH_PARAMS, SPEC$name)
+I_INT <- which(SPEC$type == "int"); I_REAL <- which(SPEC$type == "real"); I_N <- which(SPEC$type == "nint")
+I_LOGIT <- which(SPEC$type == "logit"); I_W <- which(SPEC$type == "simplex"); I_RND <- c(I_INT, I_N); N_RND <- length(I_RND)
+U_MIN <- ifelse(SPEC$type == "real", -50, -10); U_MAX <- ifelse(SPEC$type == "real", 50, 10)
+add_fixed <- function(th) utils::modifyList(as.list(th), FIXED_PARAMS)        # every parameter set carries the fixed values
+clamp_u <- function(u) pmin(pmax(u, U_MIN), U_MAX)
+
+PER_VAR_N <- function(train) if (identical(COMBINE_VARS, "univariate")) Inf else train %/% TRAIN_PER_VAR   # univariate: one variable per regression
+n_max_of <- function(W) min(N_RANGE[2], PER_VAR_N(W$train), if (TEST_PER_VAR > 0) W$test %/% TEST_PER_VAR else Inf)
+# Calibration ranges from the parameter table (each clamp is skipped when its range is the default, so results are unchanged).
+apply_ranges <- function(v) {
+  for (i in I_INT) { mx <- PARAM_MAX[SPEC$name[i]]; if (is.finite(mx)) v[i] <- min(v[i], mx) }
+  if (length(I_LOGIT) && (CORR_RANGE[1] > 0 || CORR_RANGE[2] < 1)) v[I_LOGIT] <- min(max(v[I_LOGIT], CORR_RANGE[1]), CORR_RANGE[2])
+  if (length(I_W)) { wr <- W_RANGE[SPEC$name[I_W], , drop = FALSE]
+    if (any(wr[, 1] > 0 | wr[, 2] < 1)) { w <- v[I_W]; for (it in 1:50) { w <- pmin(pmax(w, wr[, 1]), wr[, 2]); w <- w / sum(w) }; v[I_W] <- w } }
+  v
+}
+to_theta <- function(u, U = NULL, n_max = N_RANGE[2]) {
+  v <- numeric(length(u))
+  x <- SPEC$lo[I_INT] + exp(pmin(u[I_INT], 8))
+  xn <- N_RANGE[1] - 0.5 + (n_max - N_RANGE[1] + 1) * plogis(u[I_N])
+  if (is.null(U)) { v[I_INT] <- round(x); v[I_N] <- round(xn) } else {
+    v[I_INT] <- floor(x + U[seq_along(I_INT)]); v[I_N] <- floor(xn + U[length(I_INT) + 1]) }
+  v[I_N] <- min(max(v[I_N], N_RANGE[1]), n_max)
+  v[I_REAL] <- u[I_REAL]; v[I_LOGIT] <- plogis(u[I_LOGIT])
+  if (length(I_W)) { z <- exp(u[I_W] - max(u[I_W])); v[I_W] <- z / sum(z) }   # softmax: shares >= 0 summing to 1
+  v <- apply_ranges(v)
+  add_fixed(as.list(setNames(v, SPEC$name)))
+}
+theta_to_u <- function(th, n_max = N_RANGE[2]) {
+  v <- unlist(th[SPEC$name]); u <- numeric(length(v))
+  u[I_INT] <- log(pmax(v[I_INT] - SPEC$lo[I_INT], 0.5)); u[I_REAL] <- v[I_REAL]
+  u[I_N] <- qlogis(min(max((v[I_N] - N_RANGE[1] + 0.5) / (n_max - N_RANGE[1] + 1), 0.01), 0.99))
+  u[I_LOGIT] <- qlogis(min(max(v[I_LOGIT], 0.01), 0.99))
+  if (length(I_W)) u[I_W] <- log(pmax(v[I_W], 1e-6))
+  clamp_u(u)
+}
+U_INIT <- theta_to_u(as.list(setNames(SPEC$start, SPEC$name)))
+INT_NAMES <- SPEC$name[SPEC$type %in% c("int", "nint")]
+round_theta <- function(th, nm) {             # continuous (smoothed) values -> valid model parameters
+  th <- as.list(th); for (p in INT_NAMES) th[[p]] <- floor(th[[p]] + 0.5)
+  for (i in I_INT) th[[SPEC$name[i]]] <- max(th[[SPEC$name[i]]], SPEC$lo[i])
+  vv <- apply_ranges(unlist(th[SPEC$name])); for (k in seq_along(SPEC$name)) th[[SPEC$name[k]]] <- unname(vv[k])
+  th <- add_fixed(th)
+  if (WEIGHT_MODE == "simplex") { wv <- pmax(unlist(th[WEIGHTS]), 0); if (sum(wv) > 0) th[WEIGHTS] <- as.list(wv / sum(wv)) }
+  th$n <- min(max(th$n, N_RANGE[1]), nm); th$Corr_t <- min(max(th$Corr_t, 1e-9), 1 - 1e-9); th
+}
+req_scores <- function(th) max(th$Regr_Win + th$Z_Win - 1, th$Train_MO + th$Test_MO + th$Z_Win - 1)
+
+score_row <- function(D, th, e) {
+  R <- reg_sheet(D, th$Regr_Win); ZR <- zreg_sheet(D, th$Regr_Win, th$Z_Win)
+  O <- oos_sheet(D, th$Train_MO, th$Test_MO); ZO <- zoos_sheet(D, th$Train_MO, th$Test_MO, th$Z_Win)
+  Lz <- function(z) -log(abs(z) + LOGZ_EPS)
+  w <- function(k) if (k %in% WEIGHTS) th[[k]] else 0                 # dropped weights contribute nothing
+  sc <- w("b") * R$AdjR2[e, ] + w("d") * Lz(ZR$zA[e, ]) + w("e") * Lz(ZR$zC[e, ]) + w("f") * O[e, ] + w("g") * ZO[e, ]
+  if ("a" %in% WEIGHTS) sc <- sc + th$a * R$Pstd[e, ]
+  if ("c" %in% WEIGHTS) sc <- sc + th$c * Lz(ZR$zP[e, ])
+  sc
+}
+# Ranking score used by the selection: optionally averaged over past months and filtered for a stable coefficient sign.
+score_sel <- function(D, th, e) {
+  if (SCORE_AVG_MONTHS <= 1 && SIGN_MIN <= 0 && P_MAX >= 1) return(score_row(D, th, e))   # previous behaviour, exactly
+  sc <- if (SCORE_AVG_MONTHS > 1) {
+    rows <- max(1, e - SCORE_AVG_MONTHS + 1):e
+    S <- do.call(rbind, lapply(rows, function(r) score_row(D, th, r)))
+    v <- colMeans(S, na.rm = TRUE); v[colSums(is.finite(S)) < ceiling(length(rows) / 2) | is.na(S[nrow(S), ])] <- NA; v
+  } else score_row(D, th, e)
+  if (SIGN_MIN > 0) {
+    C <- reg_sheet(D, th$Regr_Win)$Coef[max(1, e - SIGN_MONTHS + 1):e, , drop = FALSE]
+    same <- colMeans(sign(C) == matrix(sign(C[nrow(C), ]), nrow(C), ncol(C), byrow = TRUE), na.rm = TRUE)
+    sc[!(is.finite(same) & same >= SIGN_MIN)] <- NA
+  }
+  if (P_MAX < 1) { pv <- reg_sheet(D, th$Regr_Win)$P[e, ]; sc[!(is.finite(pv) & pv < P_MAX)] <- NA }   # own significance now
+  sc
+}
+# VIF of candidate j against the variables already selected (training rows): 1 / (1 - R2 of j on sel)
+vif_of <- function(D, rows, others, j) {
+  A <- cbind(1, D$X[rows, others, drop = FALSE]); xj <- D$X[rows, j]; ok <- complete.cases(A, xj)
+  if (sum(ok) < ncol(A) + 3) return(Inf)
+  f <- .lm.fit(A[ok, , drop = FALSE], xj[ok]); sst <- sum((xj[ok] - mean(xj[ok]))^2)
+  if (sst <= 0) return(Inf); r2 <- 1 - sum(f$residuals^2) / sst
+  if (r2 >= 1) Inf else 1 / (1 - r2)
+}
+vif_ok <- function(D, rows, sel, j) !is.finite(VIF_MAX) || !length(sel) || vif_of(D, rows, sel, j) <= VIF_MAX
+select_vars <- function(D, sc, e, rows, n, corr_t) {
+  cand <- order(sc, decreasing = TRUE, na.last = NA)
+  sel <- integer(0); need <- ceiling(MIN_OBS_FRAC * length(rows)); K <- max(4 * n, 30); start <- 1
+  fi <- if (length(FORCE_VARS)) { f0 <- match(FORCE_VARS, D$vars); f0[!is.na(f0)] } else integer(0)
+  if (length(fi)) {                                            # economic core first (if available in this training window)
+    ok_f <- vapply(fi, function(j) !is.na(D$X[rows[length(rows)], j]) && sum(!is.na(D$X[rows, j])) >= need &&
+                     isTRUE(var(D$X[rows, j], na.rm = TRUE) > 0), TRUE)
+    sel <- head(fi[ok_f], n); cand <- setdiff(cand, fi)
+  }
+  while (length(sel) < n && start <= length(cand)) {
+    blk <- cand[start:min(length(cand), start + K - 1)]; start <- start + K
+    Xb <- D$X[rows, blk, drop = FALSE]; ok <- !is.na(D$X[rows[length(rows)], blk]) & colSums(!is.na(Xb)) >= need
+    for (j in which(ok)) {
+      if (!length(sel)) { if (isTRUE(var(Xb[, j], na.rm = TRUE) > 0)) sel <- blk[j] } else {
+        cc <- suppressWarnings(cor(Xb[, j], D$X[rows, sel, drop = FALSE], use = "pairwise.complete.obs"))
+        if (all(is.finite(cc)) && max(abs(cc)) <= corr_t && vif_ok(D, rows, sel, blk[j])) sel <- c(sel, blk[j]) }
+      if (length(sel) >= n) break
+    }
+  }
+  sel
+}
+
+windows_of <- function(W, m) {
+  test_end <- if (TEST_INCLUDES_TRADE_MONTH) m else m - 1
+  test <- (test_end - W$test + 1):test_end; e <- test[1] - 1
+  list(test = test, e = e, train = (e - W$train + 1):e)
+}
+feasible_month <- function(W, m) { w <- windows_of(W, m); w$train[1] >= 1 && m <= length(D$y) }
+
+# Rolling linearity check of the model actually used: training rows only (all before the test window, no lookahead).
+#  - RESET: does adding fitted^2 and fitted^3 improve the regression? (whole-model misspecification)
+#  - per variable: x^2 added to the full regression (F-test, Bonferroni within the model), and the variable swapped for its
+#    signed log / signed sqrt (scaled by the median |x| of the training window), compared on adjusted R2
+lin_check <- function(D, sel, A, cc, yt, fit) {
+  Ac <- A[cc, , drop = FALSE]; y <- yt[cc]; nobs <- nrow(Ac); k <- ncol(Ac); rss0 <- sum(fit$residuals^2); tss <- sum((y - mean(y))^2)
+  ftest <- function(An, q) { f <- .lm.fit(An, y); df2 <- nobs - ncol(An); if (f$rank < ncol(An) || df2 < 1) return(NA_real_)
+    rss1 <- sum(f$residuals^2); if (rss1 <= 0) return(NA_real_); pf(((rss0 - rss1) / q) / (rss1 / df2), q, df2, lower.tail = FALSE) }
+  adj <- function(rss) 1 - (rss / (nobs - k)) / (tss / (nobs - 1))
+  fv <- as.vector(Ac %*% fit$coefficients); s <- sd(fv)
+  reset_p <- if (is.finite(s) && s > 0) { z <- (fv - mean(fv)) / s; ftest(cbind(Ac, z^2, z^3), 2) } else NA_real_
+  a0 <- adj(rss0)
+  vars <- do.call(rbind, lapply(seq_along(sel), function(i) {
+    x <- Ac[, i + 1]; sc <- median(abs(x[x != 0])); if (!is.finite(sc) || sc <= 0) sc <- 1
+    sx <- sd(x); p2 <- if (is.finite(sx) && sx > 0) ftest(cbind(Ac, ((x - mean(x)) / sx)^2), 1) else NA_real_
+    swap <- function(xt) { An <- Ac; An[, i + 1] <- xt; f <- .lm.fit(An, y); if (f$rank < k) NA_real_ else adj(sum(f$residuals^2)) }
+    g <- c(Linear = a0, `Signed log` = swap(slog(x, sc)), `Signed sqrt` = swap(ssqrt(x, sc)))
+    best <- names(which.max(g)); gain <- max(g, na.rm = TRUE) - a0
+    data.frame(Variable = D$vars[sel[i]], Coef = fit$coefficients[i + 1], P_x2 = p2, Best_form = best, AdjR2_gain = gain,
+               Nonlinear = (best != "Linear" && gain >= LIN_GAIN) || (is.finite(p2) && p2 < LIN_P / length(sel)))
+  }))
+  list(reset_p = reset_p, vars = vars)
+}
+
+# Adaptive functional form (TRANSFORM_MODE = "adaptive"): for each selected variable, swap in its signed log / signed sqrt
+# (scale = median |x| on the training rows) and keep the form that raises the model's adjusted R2 by >= LIN_GAIN.
+# The combined transformed model must also beat the linear one, otherwise everything stays linear. Training rows only.
+adapt_forms <- function(sel, A, cc, yt, fit) {
+  Ac <- A[cc, , drop = FALSE]; y <- yt[cc]; nobs <- nrow(Ac); k <- ncol(Ac); tss <- sum((y - mean(y))^2)
+  adj <- function(An) { f <- .lm.fit(An, y); if (f$rank < k) NA_real_ else 1 - (sum(f$residuals^2) / (nobs - k)) / (tss / (nobs - 1)) }
+  a0 <- 1 - (sum(fit$residuals^2) / (nobs - k)) / (tss / (nobs - 1))
+  forms <- rep("Linear", length(sel)); sc <- rep(1, length(sel))
+  for (i in seq_along(sel)) {
+    x <- Ac[, i + 1]; s0 <- median(abs(x[x != 0])); if (!is.finite(s0) || s0 <= 0) s0 <- 1; sc[i] <- s0
+    g <- c(`Signed log` = { An <- Ac; An[, i + 1] <- slog(x, s0); adj(An) }, `Signed sqrt` = { An <- Ac; An[, i + 1] <- ssqrt(x, s0); adj(An) })
+    if (any(is.finite(g)) && max(g, na.rm = TRUE) - a0 >= LIN_GAIN) forms[i] <- names(which.max(g))
+  }
+  if (any(forms != "Linear")) {                                  # joint check: all chosen forms together must beat linear
+    An <- Ac; for (i in which(forms != "Linear")) An[, i + 1] <- if (forms[i] == "Signed log") slog(Ac[, i + 1], sc[i]) else ssqrt(Ac[, i + 1], sc[i])
+    aj <- adj(An); if (!is.finite(aj) || aj <= a0) forms[] <- "Linear"
+  }
+  list(forms = forms, sc = sc)
+}
+
+# Forecasts for the test months and month m from the selected variables `sel`, with shrinkage and combination.
+# Every training window ends at w$e (just before the test window), so nothing after the training data enters a fit.
+combo_forecast <- function(D, sel, w, m, X = D$X) {
+  rows_out <- c(w$test, m)
+  one <- function(tr, cols) {                                   # one regression: forecasts shrunk towards its training mean
+    A <- cbind(1, X[tr, cols, drop = FALSE]); yt <- D$y[tr]; cc <- complete.cases(A, yt)
+    if (sum(cc) < length(cols) + 3) return(NULL)
+    f <- .lm.fit(A[cc, , drop = FALSE], yt[cc]); if (f$rank < ncol(A)) return(NULL)
+    p <- as.vector(cbind(1, X[rows_out, cols, drop = FALSE]) %*% f$coefficients); yb <- mean(yt[cc])
+    yb + SHRINK * (p - yb)
+  }
+  avg <- function(L) { L <- Filter(Negate(is.null), L); if (!length(L)) return(NULL)
+    M <- do.call(cbind, L); out <- rowMeans(M, na.rm = TRUE); out[!is.finite(out)] <- NA_real_; out }
+  per_window <- function(tr) {
+    multi <- if (COMBINE_VARS != "univariate") one(tr, sel) else NULL
+    uni   <- if (COMBINE_VARS != "none") avg(lapply(sel, function(j) one(tr, j))) else NULL
+    if (COMBINE_VARS == "none") multi else if (COMBINE_VARS == "univariate") uni else avg(list(multi, uni))
+  }
+  lens <- length(w$train)
+  if (COMBINE_TRAIN > 0) {
+    g <- seq(TRAIN_WIN_RANGE[1], TRAIN_WIN_RANGE[2], TRAIN_WIN_STEP)
+    lens <- sort(unique(c(lens, g[abs(g - length(w$train)) <= COMBINE_TRAIN])))
+    lens <- lens[w$e - lens + 1 >= 1]                           # only windows with enough history
+  }
+  P <- avg(lapply(lens, function(L) per_window((w$e - L + 1):w$e)))
+  if (is.null(P)) rep(NA_real_, length(rows_out)) else P
+}
+
+# Evaluate the nowcast model for parameters th, window pair W, trade month m.
+# Fix 2: every infeasible outcome scores INFEAS (far below any real OOS R2).
+model_eval <- function(D, th, W, m, detail = FALSE) {
+  w <- windows_of(W, m)
+  if (w$train[1] < 1) return(list(ok = FALSE, obj = INFEAS - 1))
+  rk <- req_scores(th)
+  if (w$e < rk) return(list(ok = FALSE, obj = INFEAS - 0.01 * (rk - w$e)))   # windows need more history (slope guides back)
+  sel <- select_vars(D, score_sel(D, th, w$e), w$e, w$train, th$n, th$Corr_t)
+  if (!length(sel)) return(list(ok = FALSE, obj = INFEAS))
+  A <- cbind(1, D$X[w$train, sel, drop = FALSE]); yt <- D$y[w$train]; cc <- complete.cases(A, yt)
+  if (sum(cc) < length(sel) + 3) return(list(ok = FALSE, obj = INFEAS))
+  fit <- .lm.fit(A[cc, , drop = FALSE], yt[cc]); if (fit$rank < ncol(A)) return(list(ok = FALSE, obj = INFEAS))
+  A_raw <- A; fit_raw <- fit; Xsrc <- D$X; cols <- sel; forms <- rep("Linear", length(sel))
+  if (TRANSFORM_MODE == "adaptive") {                                               # functional form chosen on the training rows
+    af <- adapt_forms(sel, A, cc, yt, fit); forms <- af$forms
+    if (any(forms != "Linear")) {
+      Xsrc <- D$X[, sel, drop = FALSE]; cols <- seq_along(sel)
+      for (i in which(forms != "Linear")) Xsrc[, i] <- if (forms[i] == "Signed log") slog(Xsrc[, i], af$sc[i]) else ssqrt(Xsrc[, i], af$sc[i])
+      A <- cbind(1, Xsrc[w$train, , drop = FALSE])
+      fit <- .lm.fit(A[cc, , drop = FALSE], yt[cc]); if (fit$rank < ncol(A)) return(list(ok = FALSE, obj = INFEAS))
+    }
+  }
+  b <- fit$coefficients; ybar <- mean(yt[cc])
+  yv <- D$y[w$test]
+  if (SHRINK == 1 && COMBINE_VARS == "none" && COMBINE_TRAIN <= 0) {                # previous behaviour, exactly
+    B <- cbind(1, Xsrc[c(w$test, m), cols, drop = FALSE]); P <- as.vector(B %*% b)
+  } else P <- combo_forecast(D, cols, w, m, Xsrc)                                   # forecasts for the test months + month m
+  pt <- P[seq_along(w$test)]; ok <- is.finite(pt) & is.finite(yv)
+  if (sum(ok) < ceiling(MIN_OBS_FRAC * length(w$test))) return(list(ok = FALSE, obj = INFEAS))
+  fv <- pt[ok]; res_test <- yv[ok] - fv
+  sst <- sum((yv[ok] - ybar)^2); r2 <- if (sst > 0) 1 - sum(res_test^2) / sst else NA
+  if (!is.finite(r2)) return(list(ok = FALSE, obj = INFEAS))
+  fitted_m <- if (is.finite(P[length(P)])) P[length(P)] else NA
+  out <- list(ok = TRUE, obj = r2, sel = sel, resid = D$y[m] - fitted_m, fitted = fitted_m, actual = D$y[m],
+              sigma = sd(res_test), e = w$e, forms = forms)
+  if (detail) { s2 <- sum(fit$residuals^2) / (sum(cc) - ncol(A)); se <- sqrt(diag(chol2inv(qr.R(qr(A[cc, , drop = FALSE])))) * s2)
+    out$coef <- b[-1]; out$pval <- (2 * pt(-abs(b / se), sum(cc) - ncol(A)))[-1]; out$uni_p <- reg_sheet(D, th$Regr_Win)$P[w$e, sel]
+    out$vif <- vapply(seq_along(sel), function(i) if (length(sel) < 2) 1 else vif_of(D, w$train, sel[-i], sel[i]), 0)
+    if (HETERO_DIAG) {
+      e2 <- fit$residuals^2; Ac <- A[cc, , drop = FALSE]; fb <- .lm.fit(Ac, e2)           # Breusch-Pagan (Koenker): n x R2 of e^2 on X
+      r2b <- 1 - sum(fb$residuals^2) / sum((e2 - mean(e2))^2)
+      out$bp_stat <- sum(cc) * max(r2b, 0); out$bp_p <- pchisq(out$bp_stat, df = length(sel), lower.tail = FALSE)
+      out$var_ratio <- mean(res_test^2) / mean(fit$residuals^2)                              # > 1: errors larger in the test window
+    }
+    if (TRANSFORM_MODE != "none") out$lin <- lin_check(D, sel, A_raw, cc, yt, fit_raw) }      # check on the linear form of the model
+  out
+}
+```
+
+```{r objective}
+# Calibration objective: weighted mean OOS R2 over OBJ_WINDOWS past test windows, all ending at or before month m.
+# Window k is the model evaluated as if at month m - k * Test_Win, so the test windows are consecutive and disjoint.
+obj_eval <- function(D, th, W, m) {
+  e0 <- model_eval(D, th, W, m)
+  if (!isTRUE(e0$ok) || OBJ_WINDOWS <= 1) return(e0$obj)              # most recent window must work (keeps INFEAS guidance)
+  vals <- e0$obj; wts <- OBJ_RECENT_WEIGHT
+  for (k in seq_len(OBJ_WINDOWS - 1)) {
+    mk <- m - k * W$test
+    if (mk < 1 || windows_of(W, mk)$train[1] < 1) break                 # not enough history for older windows yet
+    ek <- model_eval(D, th, W, mk)
+    if (isTRUE(ek$ok)) { vals <- c(vals, ek$obj); wts <- c(wts, 1) }
+  }
+  sum(vals * wts) / sum(wts)
+}
+```
+
+**Lookahead check.** Selection uses scores at the end of the training window. The fit uses training months only. Test months and month *t* are priced with the training coefficients. Nothing after month *t* is used, and with `TEST_INCLUDES_TRADE_MONTH = FALSE` the calibration objective doesn't even see month *t*.
+
+# 5. Trading engine (Rule 8)
+
+For a signal at month *t*, the residual is actual − fitted:
+- **Direction:** a positive residual means overpriced, so SELL; a negative residual means BUY.
+- **Entry:** only if |residual| > `Min_Res` × SD(test residuals), on the entry day set by `ENTRY_DAY`.
+- **Exits:** TP = 1 × |residual| and SL = 1 × |residual| (fixed, `FIXED_T` / `FIXED_S`), checked against the cumulative trade return at each daily close. Otherwise the trade exits after `MAX_HOLD_M` months.
+- **Sleeves:** each trade uses 1/`MAX_HOLD_M` of equity. The portfolio holds the net exposure, and 10 bps is charged per side on exposure changes.
+
+```{r trading}
+sim_trades <- function(D, entry, dir, TP, SL, cutoff) {
+  N <- length(entry); lim <- pmin(D$mh_idx[entry], cutoff, D$n_days); H <- max(c(0, lim - entry))
+  pos <- lim - entry; reason <- character(N); hitTP_at <- logical(N); anyhit <- logical(N)
+  if (H >= 1) {
+    idx <- outer(seq_len(H), entry, "+"); valid <- idx <= rep(lim, each = H); idx <- pmin(idx, rep(lim, each = H))
+    dR <- (exp(D$L[idx] - rep(D$L[entry], each = H)) - 1) * rep(dir, each = H)
+    hTP <- valid & dR >= rep(TP, each = H); hSL <- valid & dR <= -rep(SL, each = H)
+    hit <- matrix(hTP | hSL, H, N); anyhit <- colSums(hit) > 0
+    first <- max.col(t(hit) * 1, ties.method = "first"); pos[anyhit] <- first[anyhit]
+    hitTP_at <- matrix(hTP, H, N)[cbind(pmax(first, 1), seq_len(N))] & anyhit
+  }
+  exit <- entry + pos; reason[anyhit] <- ifelse(hitTP_at[anyhit], "TP", "SL"); nh <- !anyhit
+  reason[nh] <- ifelse(lim[nh] == D$mh_idx[entry[nh]] & D$mh_full[entry[nh]], "MaxHold", ifelse(lim[nh] == cutoff, "Open", "EndOfData"))
+  list(exit = exit, gross = dir * (exp(D$L[exit] - D$L[entry]) - 1), reason = reason)
+}
+port_returns <- function(D, entry, exit, dir, from, to) {
+  nd <- to - from + 1; w <- dir / MAX_HOLD_M
+  ag <- rowsum(c(w, -w), c(entry, exit) - from + 1); dE <- numeric(nd); dE[as.integer(rownames(ag))] <- ag[, 1]
+  E <- round(cumsum(dE), 12); Ep <- c(0, E[-nd]); Ep * D$r[from:to] - COST_PER_SIDE * abs(E - Ep)
+}
+ret_x_sharpe <- function(rp) {                 # return x Sharpe; any losing combination scores its (negative) return
+  if (!length(rp)) return(0); mu <- mean(rp); R <- mu * 252; s <- sd(rp)
+  S <- if (is.finite(s) && s > 1e-12) mu / s * sqrt(252) else 0
+  if (R > 0 && S > 0) R * S else R
+}
+```
+
+**Lookahead check.** Entry is always after the signal month closes. When trade rules are calibrated, past trades are marked to market at month *t*'s close.
+
+# 6. Calibration
+
+**Monthly: model parameters.** Every month, Nesterov-accelerated SPSA calibrates the regression, z-score and OOS windows, the weights a–g, `n` and `Corr_t` to maximise the nowcast's out-of-sample R², starting from several points in parallel.
+
+- **Starts (fix 5):** the default point, random points around it, and last month's calibrated parameters (as an extra candidate; the final choice is still purely the highest objective).
+- **Best-ever tracking (fix 3):** every evaluation, including the ± perturbation probes, is a candidate. The exact parameter set (with its rounding) that produced the best value is kept.
+- **Local polish (fix 4):** starting from the SPSA winner, `n` is searched over all allowed values, and `Corr_t`, the four windows and the weights a–g are moved in small steps, one at a time, keeping any improvement. This repeats until nothing improves (at most `POLISH_ROUNDS` passes).
+- **Smoothing (optional):** each calibrated parameter, window and weight is smoothed as set in the parameter table (`SMOOTH_TABLE`: method and months per row). With `SMOOTHING = "none"` the used parameters are exactly the calibrated ones.
+
+**Window pair (fix 6).** Every month (`WINDOW_UPDATE = "monthly"`) or every January:
+
+1. **Screen:** all (`Train_Win`, `Test_Win`) pairs on the grid are scored by their OOS R², averaged over the last `WINDOW_SCORE_MONTHS` months, using the current parameters.
+2. **Joint calibration:** the top `WINDOW_TOP_K` pairs, plus the pair currently in use, each get the full parameter calibration above for this month.
+3. **Choice:** the pair with the highest calibrated OOS R² is used, together with its parameters.
+
+OOS R² from different test-window lengths isn't strictly comparable: a shorter test window is noisier and easier to fit, so this step leans towards shorter test windows.
+
+**Monthly: trade rule.** TP and SL are fixed at 1 × |residual|. After the model is set, only `Min_Res` is chosen on a grid (0 to 0.6 × residual SD, steps of 0.05) to maximise return × Sharpe of the signals from the current test window. A losing value scores its negative return.
+
+```{r calibration}
+# Fix 3: Nesterov-SPSA that keeps the best parameter set from EVERY evaluation (probes included).
+nag <- function(f, u0, B, th_of) {
+  u <- u0; v <- numeric(length(u))
+  best <- list(f = f(u), u = u, th = th_of(u, NULL))
+  keep <- function(val, uu, U) if (is.finite(val) && val > best$f) best <<- list(f = val, u = uu, th = th_of(uu, U))
+  for (it in seq_len(B$iters)) {
+    ck <- NAG_C0 / it^0.101; ak <- NAG_A0 / it^0.602; y <- u + NAG_MU * v; g <- numeric(length(u))
+    for (p in seq_len(B$n_pert)) {
+      Dl <- sample(c(-1, 1), length(u), TRUE); U <- runif(N_RND)
+      up <- clamp_u(y + ck * Dl); dn <- clamp_u(y - ck * Dl)
+      fp <- f(up, U); fm <- f(dn, U); keep(fp, up, U); keep(fm, dn, U)
+      g <- g + (fp - fm) / (2 * ck) * Dl
+    }
+    rms <- sqrt(mean(g^2))
+    v <- pmax(pmin(NAG_MU * v + ak * (if (rms > 1e-12) g / rms else 0), NAG_VMAX), -NAG_VMAX)
+    u <- clamp_u(u + v); keep(f(u), u, NULL)
+  }
+  best
+}
+
+# Fix 4: deterministic local polish in parameter space (coordinate search, keeps any improvement).
+polish <- function(D, th, W, m, nm, obj_th) {
+  best_th <- th; best_f <- obj_th(th)
+  if (POLISH_ROUNDS < 1) return(best_th)
+  w_lo <- -50; w_hi <- 50
+  for (r in seq_len(POLISH_ROUNDS)) {
+    improved <- FALSE
+    for (p in POLISH_PARAMS) {
+      cur <- best_th[[p]]
+      cand <- if (p == "n") N_RANGE[1]:nm
+        else if (p == "Corr_t") pmin(pmax(cur + c(-0.10, -0.05, 0.05, 0.10), 0.05), 0.99)
+        else if (p %in% WEIGHTS && WEIGHT_MODE == "simplex") pmax(c(0, 0.5 * cur, 2 * cur, cur - 0.1, cur + 0.1), 0)
+        else if (p %in% WEIGHTS) pmin(pmax(c(0, 0.5 * cur, 2 * cur, -cur, cur - 0.5, cur + 0.5), w_lo), w_hi)
+        else { lo <- SPEC$lo[SPEC$name == p]; st <- max(1, round(0.05 * cur)); v <- cur + c(-2, -1, 1, 2) * st; v[v >= lo] }
+      for (v in setdiff(unique(cand), cur)) {
+        th2 <- best_th; th2[[p]] <- v
+        if (p %in% WEIGHTS && WEIGHT_MODE == "simplex") { tot <- sum(unlist(th2[WEIGHTS])); if (tot <= 0) next
+          th2[WEIGHTS] <- as.list(unlist(th2[WEIGHTS]) / tot) }                    # keep shares summing to 1
+        f2 <- obj_th(th2)
+        if (is.finite(f2) && f2 > best_f + 1e-12) { best_f <- f2; best_th <- th2; improved <- TRUE }
+      }
+    }
+    if (!improved) break
+  }
+  best_th
+}
+
+# Fixes 3, 4, 5 combined. th_prev = last month's calibrated parameters (added as an extra start).
+calibrate_model <- function(D, m, W, u_warm, u_anchor, seed, th_prev = NULL) {
+  nm <- n_max_of(W)
+  th_of <- function(u, U) to_theta(u, U, nm)
+  f <- function(u, U = NULL) obj_eval(D, th_of(u, U), W, m)                     # multi-window objective
+  obj_th <- function(th) obj_eval(D, th, W, m)
+  set.seed(seed)
+  spread <- if (WARM_START) 0.7 else 1.0
+  u_prev <- if (!is.null(th_prev)) theta_to_u(round_theta(th_prev, nm), nm) else NULL
+  starts <- c(list(u_warm), if (!is.null(u_prev)) list(u_prev),
+              lapply(seq_len(max(0, CAL$starts - 1)), function(i) clamp_u(u_warm + rnorm(length(u_warm), 0, spread))))
+  res <- parallel::mclapply(seq_along(starts), function(i) { set.seed(seed + i); nag(f, starts[[i]], CAL, th_of) },
+                            mc.cores = min(N_CORES, length(starts)), mc.preschedule = FALSE)
+  if (any(vapply(res, inherits, TRUE, what = "try-error"))) stop("Worker error in calibration at month ", m)
+  best <- res[[which.max(vapply(res, `[[`, 0, "f"))]]
+  th <- polish(D, best$th, W, m, nm, obj_th)
+  cands <- c(list(th), lapply(res, `[[`, "th"))                     # winner (polished) first, then each start's best
+  ev <- model_eval(D, th, W, m)
+  objm <- obj_eval(D, th, W, m)
+  list(u = theta_to_u(th, nm), th = th, obj = if (isTRUE(ev$ok)) ev$obj else NA_real_,       # most recent window (reported as OOS R2)
+       objm = if (isTRUE(ev$ok)) objm else NA_real_,                                         # multi-window objective (used for choices)
+       cands = cands)                                                                        # candidate parameter sets (validation mode)
+}
+
+WIN_GRID <- expand.grid(train = seq(TRAIN_WIN_RANGE[1], TRAIN_WIN_RANGE[2], TRAIN_WIN_STEP),
+                        test = seq(TEST_WIN_RANGE[1], TEST_WIN_RANGE[2], TEST_WIN_STEP))
+snap_win <- function(x, rng, step) min(max(rng[1] + round((x - rng[1]) / step) * step, rng[1]), rng[2])   # nearest grid value
+win_dist2 <- function(a, b) (((a$train - b$train) / max(diff(TRAIN_WIN_RANGE), 1))^2 + ((a$test - b$test) / max(diff(TEST_WIN_RANGE), 1))^2) / 2   # safe if a range is fixed
+# Screen: returns the top_k window pairs (list, best first) by average OOS R2 over the last WINDOW_SCORE_MONTHS months.
+choose_windows <- function(D, m, th, top_k = 1) {
+  sc <- parallel::mclapply(seq_len(nrow(WIN_GRID)), function(i) {
+    W <- list(train = WIN_GRID$train[i], test = WIN_GRID$test[i]); th2 <- round_theta(th, n_max_of(W))
+    js <- max(1, m - WINDOW_SCORE_MONTHS + 1):m; js <- js[vapply(js, function(j) windows_of(W, j)$train[1] >= 1, TRUE)]
+    if (!length(js)) return(NA_real_)
+    v <- vapply(js, function(j) { ev <- model_eval(D, th2, W, j); if (isTRUE(ev$ok)) ev$obj else NA_real_ }, 0); v <- v[!is.na(v)]
+    if (!length(v)) NA_real_ else mean(v)
+  }, mc.cores = N_CORES)
+  sc <- unlist(sc); if (all(is.na(sc))) return(list())
+  o <- order(sc, decreasing = TRUE, na.last = NA); o <- o[seq_len(min(top_k, length(o)))]
+  lapply(o, function(i) list(train = WIN_GRID$train[i], test = WIN_GRID$test[i], score = sc[i]))
+}
+
+calib_trade_rules <- function(D, sig, m, W, prev) {
+  cutoff <- D$last_day[m]; w <- windows_of(W, m); months <- setdiff(w$test, m)
+  s <- sig[sig$k %in% months & !is.na(sig$entry) & sig$entry < cutoff, , drop = FALSE]
+  if (nrow(s) < MIN_SIGNALS_FOR_TRADE_CALIB) return(list(rules = DEFAULT_TRADE_RULES, obj = NA, n = nrow(s)))
+  from <- min(s$entry); nd <- cutoff - from + 1; r <- D$r[from:cutoff]; ar <- abs(s$resid)
+  nT <- length(T_GRID); nS <- length(S_GRID); ET <- matrix(Inf, nrow(s), nT); ES <- matrix(Inf, nrow(s), nS); LEN <- integer(nrow(s))
+  for (i in seq_len(nrow(s))) {
+    e <- s$entry[i]; lim <- min(D$mh_idx[e], cutoff)
+    if (lim <= e) next
+    pnl <- s$dir[i] * (exp(D$L[(e + 1):lim] - D$L[e]) - 1); LEN[i] <- length(pnl)
+    ET[i, ] <- findInterval(T_GRID * ar[i], cummax(pnl), left.open = TRUE) + 1
+    ES[i, ] <- findInterval(S_GRID * ar[i], -cummin(pnl), left.open = TRUE) + 1
+  }
+  w8 <- s$dir / MAX_HOLD_M; O <- array(NA_real_, c(nT, nS, length(MINRES_GRID)))
+  for (a in seq_len(nT)) for (b in seq_len(nS)) {
+    ex <- s$entry + pmin(ET[, a], ES[, b], LEN)
+    for (k in seq_along(MINRES_GRID)) {
+      inc <- ar > MINRES_GRID[k] * s$sigma
+      if (!any(inc)) { O[a, b, k] <- 0; next }
+      ag <- rowsum(c(w8[inc], -w8[inc]), c(s$entry[inc], ex[inc]) - from + 1)
+      dE <- numeric(nd); dE[as.integer(rownames(ag))] <- ag[, 1]
+      E <- round(cumsum(dE), 12); Ep <- c(0, E[-nd]); O[a, b, k] <- ret_x_sharpe(Ep * r - COST_PER_SIDE * abs(E - Ep))
+    }
+  }
+  score <- O
+  i <- arrayInd(which.max(score), dim(score))
+  list(rules = c(t = T_GRID[i[1]], s = S_GRID[i[2]], min_res = MINRES_GRID[i[3]]), obj = O[i], n = nrow(s))
+}
+ema <- function(prev, new, N) if (is.null(prev) || !LAYER2) new else prev + 2 / (N + 1) * (new - prev)
+roll_stat <- function(v, how) { v <- v[is.finite(v)]; if (!length(v)) return(NA_real_)
+  switch(how, median = median(v), mean = mean(v), midrange = (min(v) + max(v)) / 2, midhinge = mean(quantile(v, c(0.25, 0.75), names = FALSE)),
+         stop("Unknown smoothing statistic: ", how)) }
+SMOOTH_METHODS <- c("none", "ema", "mean", "median", "mode", "midrange", "midhinge")
+SMOOTH_NAMES   <- c("Regr_Win", "Z_Win", "Train_MO", "Test_MO", "n", "Corr_t", letters[1:7], "Min_Res", "Train_Win", "Test_Win")
+SMOOTH_SPEC <- setNames(lapply(seq_len(nrow(SMOOTH_TABLE)), function(i)
+  list(method = trimws(SMOOTH_TABLE$method[i]), months = as.numeric(SMOOTH_TABLE$months[i]))), trimws(SMOOTH_TABLE$name))
+local({
+  bad <- setdiff(names(SMOOTH_SPEC), SMOOTH_NAMES)
+  if (length(bad)) stop("Parameter table: unknown name(s) ", paste(bad, collapse = ", "), " (use ", paste(SMOOTH_NAMES, collapse = ", "), ")")
+  badm <- names(SMOOTH_SPEC)[!vapply(SMOOTH_SPEC, function(x) x$method %in% SMOOTH_METHODS, TRUE)]
+  if (length(badm)) stop("Parameter table: unknown method for ", paste(badm, collapse = ", "), " (use ", paste(SMOOTH_METHODS, collapse = ", "), ")")
+  ne <- names(SMOOTH_SPEC)[vapply(SMOOTH_SPEC, function(x) x$method == "ema" && !is.finite(x$months), TRUE)]
+  if (length(ne)) stop("Parameter table: 'ema' needs a number of months for ", paste(ne, collapse = ", "))
+  fx <- intersect(names(SMOOTH_SPEC), c(names(FIXED_PARAMS), setdiff(letters[1:7], WEIGHTS)))
+  if (length(fx)) message("Parameter table: no effect for ", paste(fx, collapse = ", "), " (fixed in FIXED_PARAMS or not in WEIGHTS)")
+  if (!LAYER2) message("SMOOTHING = 'none': every parameter is used raw")
+})
+mode_stat <- function(h) { h <- h[is.finite(h)]; if (!length(h)) return(NA_real_); tb <- table(h); top <- as.numeric(names(tb)[tb == max(tb)])
+  if (length(top) == 1) return(top); d <- abs(top - median(h)); top <- top[d == min(d)]; if (length(top) == 1) return(top)
+  for (v in rev(h)) if (v %in% top) return(v) }
+# Smoothing of one parameter / window, as set in the parameter table (no row, or SMOOTHING = "none" -> raw value).
+# prev = last smoothed value; hist = raw values up to and including this month.
+smooth_one <- function(name, prev, hist) {
+  new <- hist[length(hist)]; sp <- SMOOTH_SPEC[[name]]
+  if (!LAYER2 || is.null(sp) || sp$method == "none") return(new)
+  if (sp$method == "ema") return(ema(prev, new, sp$months))
+  h <- tail(hist, if (is.finite(sp$months)) sp$months else Inf)
+  if (sp$method == "mode") mode_stat(h) else roll_stat(h, sp$method)
+}
+
+# ---- 2-state Gaussian Markov model on a 1-column score, fitted by EM on the rows it is given ----
+# Returns the FILTERED probability of the "bad" state at the last row (uses rows 1..T only; never smoothed).
+hmm2_filter <- function(X) {
+  Z <- scale(as.matrix(X)); Tn <- nrow(Z); K <- ncol(Z); sc <- rowSums(Z); g <- sc > median(sc)   # init: above-median score = good
+  mu <- rbind(colMeans(Z[!g, , drop = FALSE]), colMeans(Z[g, , drop = FALSE]))
+  sdv <- rbind(apply(Z[!g, , drop = FALSE], 2, sd), apply(Z[g, , drop = FALSE], 2, sd)); sdv[!is.finite(sdv) | sdv < 0.1] <- 0.5
+  P <- matrix(c(0.9, 0.1, 0.1, 0.9), 2, byrow = TRUE); pi0 <- c(0.5, 0.5)
+  emis <- function() { L <- sapply(1:2, function(k) rowSums(dnorm(Z, matrix(mu[k, ], Tn, K, byrow = TRUE),
+                                                                   matrix(sdv[k, ], Tn, K, byrow = TRUE), log = TRUE)))
+                       exp(L - apply(L, 1, max)) }                                     # per-row scaling cancels in filtering
+  fwd <- function(B) { a <- matrix(0, Tn, 2); a[1, ] <- pi0 * B[1, ]; a[1, ] <- a[1, ] / sum(a[1, ])
+    for (t in 2:Tn) { v <- (a[t - 1, ] %*% P) * B[t, ]; a[t, ] <- v / sum(v) }; a }
+  for (it in seq_len(MK_ITERS)) {
+    B <- emis(); a <- fwd(B); b <- matrix(1, Tn, 2)
+    for (t in (Tn - 1):1) { v <- P %*% (B[t + 1, ] * b[t + 1, ]); b[t, ] <- v / sum(v) }
+    gm <- a * b; gm <- gm / rowSums(gm); xi <- matrix(0, 2, 2)
+    for (t in 1:(Tn - 1)) { m2 <- outer(a[t, ], B[t + 1, ] * b[t + 1, ]) * P; xi <- xi + m2 / sum(m2) }
+    P <- pmax(xi / rowSums(xi), 1e-3); P <- P / rowSums(P); pi0 <- gm[1, ]
+    for (k in 1:2) { w <- gm[, k] / sum(gm[, k]); mu[k, ] <- colSums(w * Z); sdv[k, ] <- pmax(sqrt(colSums(w * (Z - matrix(mu[k, ], Tn, K, byrow = TRUE))^2)), 0.1) }
+  }
+  a <- fwd(emis()); bad <- which.min(rowSums(mu))                                   # bad = the low-score state
+  list(p_bad = a[Tn, bad], stay_bad = P[bad, bad], stay_good = P[3 - bad, 3 - bad])
+}
+# ---- K-state Gaussian Markov model (diagonal covariance), EM on the rows given; returns FILTERED probabilities for every row ----
+hmmK_filter <- function(Z, K) {
+  Z <- as.matrix(Z); Tn <- nrow(Z); D2 <- ncol(Z)
+  g <- cut(rank(Z[, min(2, D2)], ties.method = "first"), K, labels = FALSE)       # init: split on the volatility column
+  mu <- t(sapply(1:K, function(k) colMeans(Z[g == k, , drop = FALSE])))
+  sdv <- t(sapply(1:K, function(k) apply(Z[g == k, , drop = FALSE], 2, sd))); sdv[!is.finite(sdv) | sdv < 0.1] <- 0.5
+  if (D2 == 1) { mu <- matrix(mu, K, 1); sdv <- matrix(sdv, K, 1) }
+  P <- matrix(0.1 / (K - 1), K, K); diag(P) <- 0.9; pi0 <- rep(1 / K, K)
+  emis <- function() { L <- sapply(1:K, function(k) rowSums(dnorm(Z, matrix(mu[k, ], Tn, D2, byrow = TRUE),
+                                                                   matrix(sdv[k, ], Tn, D2, byrow = TRUE), log = TRUE)))
+                       exp(L - apply(L, 1, max)) }
+  fwd <- function(B) { a <- matrix(0, Tn, K); a[1, ] <- pi0 * B[1, ]; a[1, ] <- a[1, ] / sum(a[1, ])
+    for (t in 2:Tn) { v <- (a[t - 1, ] %*% P) * B[t, ]; a[t, ] <- v / sum(v) }; a }
+  for (it in seq_len(MK_ITERS)) {
+    B <- emis(); a <- fwd(B); b <- matrix(1, Tn, K)
+    for (t in (Tn - 1):1) { v <- P %*% (B[t + 1, ] * b[t + 1, ]); b[t, ] <- v / sum(v) }
+    gm <- a * b; gm <- gm / rowSums(gm); xi <- matrix(0, K, K)
+    for (t in 1:(Tn - 1)) { m2 <- outer(a[t, ], B[t + 1, ] * b[t + 1, ]) * P; xi <- xi + m2 / sum(m2) }
+    P <- pmax(xi / rowSums(xi), 1e-3); P <- P / rowSums(P); pi0 <- gm[1, ]
+    for (k in 1:K) { w <- gm[, k] / sum(gm[, k]); mu[k, ] <- colSums(w * Z)
+      sdv[k, ] <- pmax(sqrt(colSums(w * (Z - matrix(mu[k, ], Tn, D2, byrow = TRUE))^2)), 0.1) }
+  }
+  list(alpha = fwd(emis()), stay = diag(P))
+}
+# hmm3 state for month m. H = inputs (variance ratio, volatility, R2 slope) for the months in `months`, all <= m.
+markov3_state <- function(H, months, decs, m) {
+  out <- list(p_bad = NA_real_, state = 1L, regime = NA_character_, worst = NA_character_, score = NA_real_, thr = NA_real_)
+  if (any(is.na(H[nrow(H), ]))) return(out)
+  ok <- complete.cases(H); Hc <- H[ok, , drop = FALSE]; mc <- months[ok]
+  if (is.finite(MK_HIST_WIN) && nrow(Hc) > MK_HIST_WIN) { kp <- (nrow(Hc) - MK_HIST_WIN + 1):nrow(Hc); Hc <- Hc[kp, , drop = FALSE]; mc <- mc[kp] }
+  if (nrow(Hc) < MK_MIN_HIST || any(apply(Hc, 2, sd) <= 0)) return(out)
+  f <- tryCatch(hmmK_filter(scale(Hc), 3), error = function(e) NULL); if (is.null(f)) return(out)
+  vmean <- sapply(1:3, function(k) weighted.mean(Hc[, 2], f$alpha[, k]))          # name states by volatility (stable across refits)
+  LBL <- if (MK_METHOD == "hmm3b") c("low", "mid", "high") else c("calm", "normal", "turbulent")   # named by column 2 (VR or volatility)
+  BADR <- if (MK_METHOD == "hmm3b") MK_BAD_REGIME_B else MK_BAD_REGIME
+  nm3 <- LBL[rank(vmean, ties.method = "first")]
+  sh <- max.col(f$alpha, ties.method = "first"); cur <- sh[length(sh)]
+  worst <- NA_integer_
+  dl <- if (identical(BADR, "learned")) Filter(function(x) isTRUE(x$trade) && x$m < m && x$m %in% mc, decs) else list()        # past trades, ranked only if CLOSED by month m's close
+  if (length(dl)) {
+    ent <- vapply(dl, function(x) D$entry_idx[x$m], 0); dir <- vapply(dl, function(x) -sign(x$ev$resid), 0)
+    TPv <- vapply(dl, function(x) x$tr[["t"]] * abs(x$ev$resid), 0); SLv <- vapply(dl, function(x) x$tr[["s"]] * abs(x$ev$resid), 0)
+    st <- sim_trades(D, ent, dir, TPv, SLv, D$last_day[m])
+    closed <- st$reason %in% c("TP", "SL", "MaxHold"); ret <- st$gross - 2 * COST_PER_SIDE
+    sk <- sh[match(vapply(dl, function(x) x$m, 0), mc)]
+    avg <- sapply(1:3, function(k) { s <- closed & sk == k; if (sum(s) >= MK_MIN_TRADES) mean(ret[s]) else NA_real_ })
+    if (sum(is.finite(avg)) >= 2 && min(avg, na.rm = TRUE) < MK_BAD_BELOW) worst <- which.min(avg)   # only a regime that actually lost
+  }
+  if (!identical(BADR, "learned")) {                                                # fixed in advance: no dependence on trade outcomes
+    bad_now <- nm3[cur] %in% BADR
+    return(list(p_bad = sum(f$alpha[nrow(f$alpha), nm3 %in% BADR]), state = if (bad_now) 0L else 1L, regime = nm3[cur],
+                worst = paste(BADR, collapse = "+"), score = NA_real_, thr = NA_real_, stay = f$stay[order(vmean)]))
+  }
+  list(p_bad = if (is.na(worst)) NA_real_ else f$alpha[nrow(f$alpha), worst], state = if (!is.na(worst) && cur == worst) 0L else 1L,
+       regime = nm3[cur], worst = if (is.na(worst)) NA_character_ else nm3[worst], score = NA_real_, thr = NA_real_,
+       stay = f$stay[order(vmean)])
+}
+# Binary state with hysteresis. H = all monthly inputs up to and including month t; prev = last month's state.
+markov_state <- function(H, prev) {
+  out <- list(p_bad = NA_real_, state = prev, stay_bad = NA_real_, stay_good = NA_real_, score = NA_real_)
+  if (is.null(H) || any(is.na(H[nrow(H), ]))) return(out)                           # no inputs this month: keep the state
+  Hc <- H[complete.cases(H), , drop = FALSE]
+  if (is.finite(MK_HIST_WIN) && nrow(Hc) > MK_HIST_WIN) Hc <- Hc[(nrow(Hc) - MK_HIST_WIN + 1):nrow(Hc), , drop = FALSE]
+  if (nrow(Hc) < MK_MIN_HIST || any(apply(Hc, 2, sd) <= 0)) { out$state <- 1L; return(out) }
+  score <- matrix(rowSums(scale(Hc)), ncol = 1)               # combined score: z(log2 variance ratio) + z(OOS R2), standardised on history only
+  if (MK_METHOD == "threshold") {                             # quantile of the score history (up to and including month t)
+    thr <- unname(quantile(score[, 1], MK_QUANTILE)); sc_t <- score[nrow(score), 1]
+    return(list(p_bad = as.numeric(sc_t < thr), state = if (sc_t < thr) 0L else 1L, stay_bad = NA_real_, stay_good = NA_real_,
+                score = sc_t, thr = thr))
+  }
+  f <- tryCatch(hmm2_filter(score), error = function(e) NULL); if (is.null(f) || !is.finite(f$p_bad)) return(out)
+  st <- if (prev == 1L && f$p_bad > MK_ENTER) 0L else if (prev == 0L && f$p_bad < MK_EXIT) 1L else prev
+  list(p_bad = f$p_bad, state = st, stay_bad = f$stay_bad, stay_good = f$stay_good, score = score[nrow(score), 1])
+}
+```
+
+**Lookahead check.** Every objective at month *t* uses data up to *t* − 1 (or *t* with `TEST_INCLUDES_TRADE_MONTH = TRUE`). Past trades are marked to market at *t*'s close. The window screen and the joint calibration only use months up to *t*. The moving averages only use past calibrations.
+
+# 7. Lookahead tests
+
+Each step is recomputed on data truncated at month *k* and must match the full-data result exactly.
+
+```{r lookahead-tests}
+th0 <- to_theta(U_INIT); W0 <- list(train = TRAIN_WIN_RANGE[1], test = TEST_WIN_RANGE[1])
+k_test <- max(W0$train + W0$test + 14, floor(D$Tn * 0.6))
+TRc <- truncate_inputs(MON, DAY, k_test); Dt <- make_data(TRc$MON, TRc$DAY)
+same <- function(a, b) isTRUE(all.equal(a[seq_len(nrow(b)), , drop = FALSE], b, tolerance = 1e-9))
+e_full <- model_eval(D, th0, W0, k_test, TRUE); e_tr <- model_eval(Dt, th0, W0, k_test, TRUE)
+sig0 <- do.call(rbind, lapply((k_test - W0$test):(k_test - 1), function(j) { ev <- model_eval(D, th0, W0, j)
+  if (!ev$ok || !is.finite(ev$resid)) return(NULL)
+  data.frame(k = j, entry = D$entry_idx[j], dir = -sign(ev$resid), resid = ev$resid, sigma = ev$sigma) }))
+LA <- data.frame(
+  Step = c("P values, standardized P, adj. R2, coefficients", "Z-scores", "Per-variable OOS R2 and its z-score",
+           "Selection + nowcast + OOS R2 objective + residual", "Trade-rule calibration (Min_Res; TP/SL fixed)",
+           "Multi-window calibration objective", "Validation-window evaluation",
+           "Transforms, VIF, heteroskedasticity and rolling linearity diagnostics", "Markov state (history up to t only, deterministic)"),
+  Pass = c(all(mapply(same, reg_sheet(D, th0$Regr_Win), reg_sheet(Dt, th0$Regr_Win))),
+           all(mapply(same, zreg_sheet(D, th0$Regr_Win, th0$Z_Win), zreg_sheet(Dt, th0$Regr_Win, th0$Z_Win))),
+           same(oos_sheet(D, th0$Train_MO, th0$Test_MO), oos_sheet(Dt, th0$Train_MO, th0$Test_MO)) &&
+             same(zoos_sheet(D, th0$Train_MO, th0$Test_MO, th0$Z_Win), zoos_sheet(Dt, th0$Train_MO, th0$Test_MO, th0$Z_Win)),
+           identical(e_full$sel, e_tr$sel) && isTRUE(all.equal(e_full[c("obj", "resid", "sigma")], e_tr[c("obj", "resid", "sigma")])),
+           is.null(sig0) || isTRUE(all.equal(calib_trade_rules(D, sig0, k_test, W0, NULL), calib_trade_rules(Dt, sig0, k_test, W0, NULL))),
+           isTRUE(all.equal(obj_eval(D, th0, W0, k_test), obj_eval(Dt, th0, W0, k_test))),
+           isTRUE(all.equal(model_eval(D, th0, list(train = W0$train, test = VAL_WIN), k_test)[c("obj", "resid")],
+                            model_eval(Dt, th0, list(train = W0$train, test = VAL_WIN), k_test)[c("obj", "resid")])),
+           same(D$X, Dt$X) && isTRUE(all.equal(e_full[c("vif", "bp_stat", "var_ratio", "lin")], e_tr[c("vif", "bp_stat", "var_ratio", "lin")])),
+           local({ set.seed(1); Hx <- cbind(rnorm(80), rnorm(80)); a1 <- markov_state(Hx[1:60, ], 1L); a2 <- markov_state(Hx[1:60, ], 1L)
+                   isTRUE(all.equal(a1, a2)) && is.finite(a1$p_bad) &&
+                   { f1 <- hmmK_filter(scale(Hx[1:60, ]), 3); f2 <- hmmK_filter(scale(Hx[1:60, ]), 3); isTRUE(all.equal(f1, f2)) } })))
+LA$Result <- ifelse(LA$Pass, "PASS", "FAIL"); LA[, c("Step", "Result")]
+if (!all(LA$Pass)) stop("Lookahead test failed - stopping.")
+rm(Dt, TRc)
+```
+
+# 8. Benchmark
+
+```{r benchmark}
+m_b <- min(D$Tn, max(W0$train + W0$test + 30, floor(D$Tn * 0.7)))
+t_eval <- system.time(for (i in 1:20) model_eval(D, to_theta(U_INIT + rnorm(length(U_INIT), 0, 0.1), runif(N_RND)), W0, m_b))[["elapsed"]] / 20
+t_cal  <- system.time(calibrate_model(D, m_b, W0, U_INIT, U_INIT, 1, th0))[["elapsed"]]
+t_win  <- system.time(choose_windows(D, m_b, th0, WINDOW_TOP_K))[["elapsed"]]
+n_months <- D$Tn - (W0$train + W0$test); n_years <- ceiling(n_months / 12)
+n_upd <- if (WINDOW_UPDATE == "monthly") n_months else n_years          # window screens
+n_cal <- if (WINDOW_UPDATE == "monthly") n_months * (WINDOW_TOP_K + 1) else n_months + n_years * WINDOW_TOP_K   # calibrations (upper bound)
+proj <- (n_cal * t_cal + n_months + n_upd * t_win) / 3600
+data.frame(Measure = c("One model evaluation", "One calibration (SPSA + polish)", "One window screen",
+                       "Months to calibrate", "Calibrations (upper bound)", "Projected total"),
+           Value = c(sprintf("%.1f ms", 1000 * t_eval), sprintf("%.1f s", t_cal), sprintf("%.1f s", t_win), n_months, n_cal,
+                     sprintf("%.1f h (likely range %.1f - %.1f h)", proj, 0.7 * proj, 2 * proj)))
+```
+
+# 9. Monthly backtest
+
+Progress is written to `progress.log` in the results folder, and a checkpoint is saved every 12 months, so knitting again resumes where it stopped.
+
+```{r backtest, message=NA}
+CK_FILE <- file.path(OUT_DIR, sprintf("checkpoint_%s.rds", if (QUICK_MODE) "quick" else "full"))
+SIGNATURE <- paste("v3fix", STOCK, DAILY_FILE, Y_FROM_DAILY, QUICK_MODE, ENTRY_DAY, COST_PER_SIDE, MAX_HOLD_M, D$Tn, D$V, signif(sum(D$y, na.rm = TRUE), 10), nrow(DAY),
+                   TRAIN_WIN_RANGE, TRAIN_WIN_STEP, TEST_WIN_RANGE, TEST_WIN_STEP, TRAIN_PER_VAR, TEST_PER_VAR, N_RANGE,
+                   WINDOW_SCORE_MONTHS, WINDOW_UPDATE, WINDOW_TOP_K, TEST_INCLUDES_TRADE_MONTH, SMOOTHING, "table", paste(deparse(SMOOTH_SPEC), collapse = ""),
+                   WARM_START, INFEAS, POLISH_ROUNDS, POLISH_PARAMS, "force", FORCE_VARS, PARAM_MIN, "stable", SCORE_AVG_MONTHS, SIGN_MIN, SIGN_MONTHS, "pmax", P_MAX, "ranges", PARAM_MIN, PARAM_MAX, N_RANGE, CORR_RANGE, W_RANGE, MINRES_GRID, WEIGHTS, P_TRANSFORM, WEIGHT_MODE, VIF_MAX, HETERO_DIAG, TRANSFORM_MODE, MARKOV_MODE, MK_METHOD, MK_VOL_MONTHS, MK_SLOPE_MONTHS, MK_MIN_TRADES, MK_BAD_BELOW, MK_BAD_REGIME, MK_DEV_MONTHS, MK_INPUT1, MK_B_SLOPE_MONTHS, MK_BAD_REGIME_B, COMBINED_STRATEGY, COMBINED_MARKOV, MK_ENS_WINDOWS, MK_CALM_Q, MK_FLIP_VOTES, MK_SKIP_VOTES, MK_USE_CALM, MK_QUANTILE, MK_ENTER, MK_EXIT, MK_MIN_HIST, MK_ITERS, MK_HIST_WIN, OBJ_WINDOWS, OBJ_RECENT_WEIGHT, VALIDATION_MODE, VAL_WIN, VAL_GATE, unlist(FIXED_PARAMS), names(FIXED_PARAMS),
+                   unlist(CAL), FIXED_T, FIXED_S, MINRES_GRID, DATA_FILE, "ownstart2", OWN_START, OWN_START_DRAWS, OWN_START_TOP, "linroll", LIN_P, LIN_GAIN, "combo", SHRINK, COMBINE_VARS, COMBINE_TRAIN, collapse = "|")
+if (!OWN_START) SIGNATURE <- gsub(paste("", "ownstart2", OWN_START, OWN_START_DRAWS, OWN_START_TOP, "linroll "), " linroll ", SIGNATURE, fixed = TRUE)
+                                                                     # OWN_START = FALSE -> default start for every stock
+if (!is.na(DS)) SIGNATURE <- paste(SIGNATURE, "datastart", format(DS), sep = "|")
+LOG_FILE <- file.path(OUT_DIR, "progress.log")
+log_line <- function(...) { s <- paste0(format(Sys.time(), "%H:%M:%S"), "  ", ...); message(s); cat(s, "\n", file = LOG_FILE, append = TRUE) }
+
+VSHIFT <- if (VALIDATION_MODE) VAL_WIN else 0                      # calibration happens VAL_WIN months before the trade month
+m_first <- which(vapply(seq_len(D$Tn), function(m) m - VSHIFT >= 1 && windows_of(W0, m - VSHIFT)$train[1] >= 1, TRUE))[1]
+
+# ---- own starting point (OWN_START): this stock's first feasible month, random sets in the table's ranges, best few optimised ----
+START_DESC <- "default (Regr 36, Z 30, Train_MO 24, Test_MO 9, n 5, Corr_t 0.7, equal weights)"
+START_TAB <- NULL
+if (OWN_START) {
+  OS_FILE <- file.path(OUT_DIR, sprintf("own_start_%s.rds", if (QUICK_MODE) "quick" else "full"))
+  os <- if (file.exists(OS_FILE)) readRDS(OS_FILE) else NULL
+  if (is.null(os) || !identical(os$signature, SIGNATURE)) {
+    nm0 <- n_max_of(W0); th_of0 <- function(u, U) to_theta(u, U, nm0)
+    hi_int <- function(p) { mx <- PARAM_MAX[[p]]; if (is.finite(mx)) mx else 100 }
+    draw_u <- function() {                                             # one random parameter set anywhere in the ranges
+      th <- as.list(setNames(SPEC$start, SPEC$name))
+      for (i in I_INT) th[[SPEC$name[i]]] <- sample(SPEC$lo[i]:max(SPEC$lo[i], hi_int(SPEC$name[i])), 1)
+      if (length(I_N)) th[[SPEC$name[I_N]]] <- sample(N_RANGE[1]:max(N_RANGE[1], min(N_RANGE[2], nm0)), 1)
+      if (length(I_LOGIT)) th[[SPEC$name[I_LOGIT]]] <- runif(1, max(CORR_RANGE[1], 0.05), min(CORR_RANGE[2], 0.99))
+      if (length(I_W)) { g <- rexp(length(I_W)); th[SPEC$name[I_W]] <- as.list(g / sum(g)) }
+      if (length(I_REAL)) for (i in I_REAL) th[[SPEC$name[i]]] <- rnorm(1)
+      theta_to_u(th, nm0) }
+    set.seed(SEED + 777); pool <- c(list(U_INIT), lapply(seq_len(OWN_START_DRAWS), function(i) draw_u()))
+    feas <- function(v) is.finite(v) & v > INFEAS / 2
+    m0 <- NA; sc <- NULL
+    for (m in seq(m_first, D$Tn)) {                                    # first month where any set gives a working model
+      mc <- m - VSHIFT; if (mc < 1) next
+      sc <- unlist(parallel::mclapply(pool, function(u) obj_eval(D, th_of0(u, NULL), W0, mc), mc.cores = N_CORES))
+      if (any(feas(sc))) { m0 <- m; break }
+    }
+    if (is.na(m0)) { os <- list(signature = SIGNATURE, u = U_INIT, m0 = NA, obj = NA, obj_default = NA)
+    } else {
+      mc <- m0 - VSHIFT; f0 <- function(u, U = NULL) obj_eval(D, th_of0(u, U), W0, mc)
+      top <- order(ifelse(feas(sc), sc, -Inf), decreasing = TRUE)[seq_len(min(OWN_START_TOP, sum(feas(sc))))]
+      CAL0 <- list(starts = 1, iters = max(30, CAL$iters), n_pert = CAL$n_pert)
+      res <- parallel::mclapply(top, function(i) { set.seed(SEED + 900 + i); nag(f0, pool[[i]], CAL0, th_of0) },
+                                mc.cores = min(N_CORES, length(top)), mc.preschedule = FALSE)
+      best <- res[[which.max(vapply(res, `[[`, 0, "f"))]]
+      os <- list(signature = SIGNATURE, u = theta_to_u(best$th), th = best$th, m0 = m0, obj = best$f, obj_default = sc[1])
+    }
+    saveRDS(os, OS_FILE)
+  }
+  if (!is.na(os$m0)) {
+    U_INIT <- os$u; th0 <- to_theta(U_INIT)
+    m_first <- max(m_first, os$m0)                                     # no month before the start was found (no lookahead)
+    START_DESC <- sprintf("own, found at %s: Regr %d, Z %d, Train_MO %d, Test_MO %d, n %d, Corr_t %.2f, weights %s (OOS R2 %.3f vs default %s)",
+      format(D$dates[os$m0], "%Y-%m"), th0$Regr_Win, th0$Z_Win, th0$Train_MO, th0$Test_MO, th0$n, th0$Corr_t,
+      paste(sprintf("%s %.2f", WEIGHTS, unlist(th0[WEIGHTS])), collapse = " / "), os$obj,
+      if (is.finite(os$obj_default) && os$obj_default > INFEAS / 2) sprintf("%.3f", os$obj_default) else "infeasible")
+  } else START_DESC <- "default (no month with a working model found for the own start)"
+  log_line(STOCK, " starting point: ", START_DESC)
+}
+state <- list(m_next = m_first, W = NULL, W_used = NULL, win_hist = NULL, u_raw = NULL, th_raw = NULL, ema_th = NULL, tr_raw = NULL, tr_used = NULL,
+              rows = list(), sig = data.frame(k = integer(0), entry = integer(0), dir = numeric(0), resid = numeric(0), sigma = numeric(0)),
+              dec = list(), winlog = list(), strat = list(), vallog = list(), mk_hist = NULL, mk_state = 1L,
+              mk_r2 = numeric(0), mk_H3 = NULL, mk_m3 = integer(0), mk_He = list())
+if (file.exists(CK_FILE)) { ck <- readRDS(CK_FILE); if (identical(ck$signature, SIGNATURE)) { state <- ck$state
+  log_line("Resumed at ", format(D$dates[min(state$m_next, D$Tn)], "%Y-%m")) } }
+
+LONG_NAMES <- c("Regr_Win", "Z_Win", "Train_MO", "Test_MO", "n")
+same_pair <- function(a, b) a$train == b$train && a$test == b$test
+t_start <- Sys.time()
+for (m in seq(state$m_next, D$Tn)) {
+  if (m > D$Tn) break
+  u_warm <- if (WARM_START && !is.null(state$u_raw)) state$u_raw else U_INIT
+  cal <- NULL; m_cal <- m - VSHIFT                                     # calibration month (test window ends VAL_WIN months back)
+  # (1) window pair (fix 6): screen the grid, fully calibrate the top K + current pair, keep the best calibrated OOS R2
+  if (is.null(state$W) || WINDOW_UPDATE == "monthly" || format(D$dates[m], "%m") == "01") {
+    th_cur <- if (is.null(state$ema_th)) th0 else state$ema_th
+    cands <- choose_windows(D, m_cal, th_cur, WINDOW_TOP_K)
+    if (!is.null(state$W) && !any(vapply(cands, same_pair, TRUE, b = state$W)))
+      cands <- c(cands, list(list(train = state$W$train, test = state$W$test, score = NA_real_)))
+    if (length(cands)) {
+      cals <- lapply(cands, function(Wc) calibrate_model(D, m_cal, Wc, u_warm, state$u_raw, SEED + m, state$th_raw))
+      ob <- vapply(cals, function(x) if (is.finite(x$objm)) x$objm else -Inf, 0)   # choose the pair on the multi-window objective
+      j <- which.max(ob); state$W <- cands[[j]]; cal <- cals[[j]]
+      state$winlog[[length(state$winlog) + 1]] <- data.frame(Month = format(D$dates[m], "%Y-%m"),
+        Train_Win = state$W$train, Test_Win = state$W$test, Screen_Avg_OOS_R2 = state$W$score,
+        Calibrated_OOS_R2 = cal$obj, Calibrated_Objective_Multi = cal$objm, Pairs_Calibrated = length(cands),
+        Best_Other_Calibrated = if (length(ob) > 1 && any(is.finite(ob[-j]))) max(ob[-j][is.finite(ob[-j])]) else NA_real_)
+    }
+  }
+  if (is.null(state$W)) { state$m_next <- m + 1; next }
+  W <- state$W                                                         # raw (calibrated) window pair
+  state$win_hist <- rbind(state$win_hist, c(W$train, W$test))                 # raw window choices up to month m
+  vt <- smooth_one("Train_Win", state$sm_prev$Train_Win, state$win_hist[, 1]); state$sm_prev$Train_Win <- vt
+  vs <- smooth_one("Test_Win",  state$sm_prev$Test_Win,  state$win_hist[, 2]); state$sm_prev$Test_Win  <- vs
+  W_used <- list(train = snap_win(vt, TRAIN_WIN_RANGE, TRAIN_WIN_STEP), test = snap_win(vs, TEST_WIN_RANGE, TEST_WIN_STEP))
+  if (windows_of(W_used, m)$train[1] < 1) W_used <- list(train = W$train, test = W$test)   # safety: never use a pair without enough history
+  state$W_used <- W_used
+  nm <- n_max_of(W)
+  # (2) model parameters: SPSA (best-ever) + polish, extra start from last month (fixes 3-5); optional smoothing
+  if (is.null(cal)) cal <- calibrate_model(D, m_cal, W, u_warm, state$u_raw, SEED + m, state$th_raw)
+  state$u_raw <- cal$u; th_raw <- cal$th; state$th_raw <- th_raw
+  for (p in SPEC$name) state$th_hist[[p]] <- c(state$th_hist[[p]], th_raw[[p]])     # raw history (rolling smoothers)
+  new_ema <- lapply(SPEC$name, function(p) unname(smooth_one(p, state$ema_th[[p]], state$th_hist[[p]])))
+  state$ema_th <- setNames(new_ema, SPEC$name)
+  nm_used <- n_max_of(W_used)
+  th_used <- round_theta(state$ema_th, nm_used)
+  if (!VALIDATION_MODE) {
+  ev <- model_eval(D, th_used, W_used, m, detail = TRUE)
+  # (3) trade rules: grid on return x Sharpe, then Min_Res smoothed as set in the parameter table
+  trc <- calib_trade_rules(D, state$sig, m, W_used, state$tr_raw)
+  state$tr_raw <- trc$rules
+  state$tr_hist <- rbind(state$tr_hist, trc$rules)
+  prev_mr <- if (is.null(state$tr_used)) NULL else state$tr_used[["min_res"]]
+  state$tr_used <- trc$rules; state$tr_used[["min_res"]] <- smooth_one("Min_Res", prev_mr, state$tr_hist[, "min_res"])   # TP / SL are fixed
+  tr <- state$tr_used
+  # (4) signal and trade
+  trade <- FALSE
+  if (isTRUE(ev$ok) && is.finite(ev$resid)) {
+    state$sig <- rbind(state$sig, data.frame(k = m, entry = D$entry_idx[m], dir = -sign(ev$resid), resid = ev$resid, sigma = ev$sigma))
+    trade <- abs(ev$resid) > tr[["min_res"]] * ev$sigma && !is.na(D$entry_idx[m])
+  }
+  state$dec[[length(state$dec) + 1]] <- list(m = m, ev = ev, tr = tr, trade = trade)
+  } else {
+  # ---- validation stage: the four strategies ----
+  W_val  <- list(train = W_used$train, test = VAL_WIN)               # training window ends just before the validation window
+  nm_val <- min(N_RANGE[2], PER_VAR_N(W_val$train))
+  W_hist <- list(train = W_used$train, test = W$test + VAL_WIN)       # past signals used to calibrate Min_Res
+  val_of <- function(th) { e <- model_eval(D, round_theta(th, nm_val), W_val, m); if (isTRUE(e$ok)) e$obj else -Inf }
+  vc <- vapply(cal$cands, val_of, 0); ia <- which.max(vc)              # candidate that holds up best on validation
+  use_a  <- is.finite(vc[1]) && vc[1] < 0                              # (d): winner failed validation -> use the best validation candidate
+  choice <- list(base = cal$th, a = cal$cands[[ia]], b = cal$th, c = cal$cands[[ia]], d = if (use_a) cal$cands[[ia]] else cal$th)
+  gated  <- c(base = FALSE, a = FALSE, b = TRUE, c = TRUE, d = FALSE)
+  empty_sig <- data.frame(k = integer(0), entry = integer(0), dir = numeric(0), resid = numeric(0), sigma = numeric(0))
+  for (sname in names(choice)) {
+    S <- state$strat[[sname]]; if (is.null(S)) S <- list(ema = NULL, tr_raw = NULL, tr_used = NULL, sig = empty_sig, dec = list())
+    thc <- choice[[sname]]
+    for (p in SPEC$name) S$th_hist[[p]] <- c(S$th_hist[[p]], thc[[p]])
+    S$ema <- setNames(lapply(SPEC$name, function(p) unname(smooth_one(p, S$ema[[p]], S$th_hist[[p]]))), SPEC$name)
+    th_s <- round_theta(S$ema, nm_val)
+    ev_s <- model_eval(D, th_s, W_val, m, detail = TRUE)               # validation OOS R2 (ev_s$obj) + trade-month residual
+    trc_s <- calib_trade_rules(D, S$sig, m, W_hist, S$tr_raw)
+    S$tr_raw <- trc_s$rules
+    S$tr_hist <- rbind(S$tr_hist, trc_s$rules)
+    prev_mr <- if (is.null(S$tr_used)) NULL else S$tr_used[["min_res"]]
+    S$tr_used <- trc_s$rules; S$tr_used[["min_res"]] <- smooth_one("Min_Res", prev_mr, S$tr_hist[, "min_res"])
+    pass <- !gated[[sname]] || (isTRUE(ev_s$ok) && ev_s$obj > VAL_GATE)
+    trade_s <- FALSE
+    if (isTRUE(ev_s$ok) && is.finite(ev_s$resid)) {
+      S$sig <- rbind(S$sig, data.frame(k = m, entry = D$entry_idx[m], dir = -sign(ev_s$resid), resid = ev_s$resid, sigma = ev_s$sigma))
+      trade_s <- pass && abs(ev_s$resid) > S$tr_used[["min_res"]] * ev_s$sigma && !is.na(D$entry_idx[m])
+    }
+    S$dec[[length(S$dec) + 1]] <- list(m = m, ev = ev_s, tr = S$tr_used, trade = trade_s, pass = pass, th = th_s, trc = trc_s)
+    state$strat[[sname]] <- S
+  }
+  state$vallog[[length(state$vallog) + 1]] <- data.frame(Month = format(D$dates[m], "%Y-%m"), Candidates = length(vc),
+    Val_R2_winner = vc[1], Val_R2_best_candidate = vc[ia], Chosen_is_winner = ia == 1,
+    Val_R2_base_used = state$strat$base$dec[[length(state$strat$base$dec)]]$ev$obj,
+    Gate_b_pass = state$strat$b$dec[[length(state$strat$b$dec)]]$pass, Gate_c_pass = state$strat$c$dec[[length(state$strat$c$dec)]]$pass,
+    Trade_base = state$strat$base$dec[[length(state$strat$base$dec)]]$trade, Trade_a = state$strat$a$dec[[length(state$strat$a$dec)]]$trade,
+    Trade_b = state$strat$b$dec[[length(state$strat$b$dec)]]$trade, Trade_c = state$strat$c$dec[[length(state$strat$c$dec)]]$trade,
+    Switch_uses = if (use_a) "a (choose)" else "base", Trade_d = state$strat$d$dec[[length(state$strat$d$dec)]]$trade)
+  # the baseline strategy drives the standard outputs (Trades, charts, forward check)
+  db <- state$strat$base$dec[[length(state$strat$base$dec)]]
+  ev <- db$ev; tr <- db$tr; trade <- db$trade; th_used <- db$th; trc <- db$trc; nm_used <- nm_val
+  state$dec[[length(state$dec) + 1]] <- list(m = m, ev = ev, tr = tr, trade = trade)
+  }
+  # (5) Markov state from this month's variance ratio and OOS R2 (history up to month t only)
+  mk <- list(p_bad = NA_real_, state = 1L, stay_bad = NA_real_, stay_good = NA_real_, score = NA_real_); mk_x <- c(NA_real_, NA_real_)
+  mk_x3 <- c(NA_real_, NA_real_, NA_real_)
+  if (MARKOV_MODE) {
+    mk_x <- c(if (isTRUE(ev$ok) && is.finite(ev$var_ratio %||% NA)) max(min(log2(ev$var_ratio), 4), -4) else NA_real_,
+              if (isTRUE(ev$ok) && is.finite(ev$obj)) max(min(ev$obj, 1), -1) else NA_real_)
+    state$mk_hist <- rbind(state$mk_hist, mk_x)
+    if (MK_METHOD == "hmm3b") {
+      sigs_mk <- if (VALIDATION_MODE) state$strat$base$sig else state$sig        # all baseline signals so far (traded or not)
+      input1 <- function(w) {
+        if (identical(MK_INPUT1, "reversion")) {                                  # reversion efficacy over the last w completed signals
+          sg <- sigs_mk[sigs_mk$k <= m - 1 & is.finite(sigs_mk$resid), , drop = FALSE]; sg <- tail(sg, w)
+          if (!nrow(sg)) return(NA_real_)
+          nx <- D$y[sg$k + 1]; ok <- is.finite(nx)                               # next-month return, known by month m's close
+          if (sum(ok) < max(8, ceiling(w / 2)) || sd(sg$resid[ok]) <= 0 || sd(nx[ok]) <= 0) return(NA_real_)
+          return(cor(sg$resid[ok], nx[ok]))
+        }
+        pw <- D$y[max(1, m - w):(m - 1)]; pw <- pw[is.finite(pw)]                 # "retdev": return deviation z-score
+        if (length(pw) >= ceiling(0.8 * w) && sd(pw) > 0 && is.finite(D$y[m])) (D$y[m] - mean(pw)) / sd(pw) else NA_real_
+      }
+      dev <- input1(MK_DEV_MONTHS)
+      state$mk_r2 <- c(state$mk_r2, mk_x[2]); r2w <- tail(state$mk_r2, MK_B_SLOPE_MONTHS); okr <- is.finite(r2w)
+      slope <- if (sum(okr) >= ceiling(2 * MK_B_SLOPE_MONTHS / 3)) unname(coef(lm(r2w[okr] ~ seq_along(r2w)[okr]))[2]) else NA_real_
+      mk_x3 <- c(dev, mk_x[1], slope)                                                # column 2 = variance ratio (names the states)
+      state$mk_H3 <- rbind(state$mk_H3, mk_x3); state$mk_m3 <- c(state$mk_m3, m)
+      mk <- markov3_state(state$mk_H3, state$mk_m3, state$dec, m)
+      # ---- ensemble over input windows + calm-volatility confirmation (history up to month m only) ----
+      ens <- vapply(seq_along(MK_ENS_WINDOWS), function(k) {
+        w <- MK_ENS_WINDOWS[k]; dv <- input1(w)
+        rw <- tail(state$mk_r2, w); ok2 <- is.finite(rw)
+        sl <- if (sum(ok2) >= ceiling(2 * w / 3)) unname(coef(lm(rw[ok2] ~ seq_along(rw)[ok2]))[2]) else NA_real_
+        prevH <- if (length(state$mk_He) >= k) state$mk_He[[k]] else NULL
+        state$mk_He[[k]] <<- rbind(prevH, c(dv, mk_x[1], sl))
+        r <- markov3_state(state$mk_He[[k]], state$mk_m3, state$dec, m)$regime; if (is.na(r)) NA_character_ else r }, "")
+      vol_of <- function(j) { f1 <- D$first_day[max(1, j - MK_VOL_MONTHS + 1)]; l1 <- D$last_day[j]
+        if (is.na(f1) || is.na(l1) || l1 - f1 < 10) NA_real_ else sd(D$r[f1:l1]) * sqrt(252) }
+      vhist <- vapply(seq_len(m), vol_of, 0); vt <- vhist[m]
+      calm <- is.finite(vt) && sum(is.finite(vhist)) >= 24 && vt <= quantile(vhist, MK_CALM_Q, na.rm = TRUE)
+      n_low <- sum(ens == "low", na.rm = TRUE); n_fit <- sum(!is.na(ens))
+      flip_ok <- n_fit == length(MK_ENS_WINDOWS) && n_low >= MK_FLIP_VOTES && (!MK_USE_CALM || calm)
+      skip_ok <- n_low >= MK_SKIP_VOTES || (MK_USE_CALM && calm)
+      mk$action <- if (flip_ok) -1L else if (skip_ok) 0L else 1L
+      mk$ens <- paste(ifelse(is.na(ens), "-", ens), collapse = "/"); mk$n_low <- n_low; mk$calm <- calm; mk$vol <- vt
+    } else if (MK_METHOD == "hmm3") {
+      f1 <- D$first_day[max(1, m - MK_VOL_MONTHS + 1)]; l1 <- D$last_day[m]
+      vol <- if (is.na(f1) || is.na(l1) || l1 - f1 < 10) NA_real_ else log(sd(D$r[f1:l1]) * sqrt(252))
+      state$mk_r2 <- c(state$mk_r2, mk_x[2]); r2w <- tail(state$mk_r2, MK_SLOPE_MONTHS); okr <- is.finite(r2w)
+      slope <- if (sum(okr) >= ceiling(2 * MK_SLOPE_MONTHS / 3)) unname(coef(lm(r2w[okr] ~ seq_along(r2w)[okr]))[2]) else NA_real_
+      mk_x3 <- c(mk_x[1], vol, slope)
+      state$mk_H3 <- rbind(state$mk_H3, mk_x3); state$mk_m3 <- c(state$mk_m3, m)
+      mk <- markov3_state(state$mk_H3, state$mk_m3, state$dec, m)
+    } else { mk <- markov_state(state$mk_hist, state$mk_state); state$mk_state <- mk$state }
+  }
+  state$dec[[length(state$dec)]]$mk <- mk
+  state$rows[[length(state$rows) + 1]] <- c(list(Month = format(D$dates[m], "%Y-%m"), Train_Win = W_used$train, Test_Win = W_used$test,
+    Train_Win_raw = W$train, Test_Win_raw = W$test, n_max = nm_used),
+    setNames(th_raw[SPEC$name], paste0(SPEC$name, "_raw")), th_used[c(SPEC$name, names(FIXED_PARAMS))],
+    list(OOS_R2_raw = cal$obj, Objective_Multi_raw = cal$objm, OOS_R2_used = if (isTRUE(ev$ok)) ev$obj else NA,
+         t_raw = trc$rules[["t"]], s_raw = trc$rules[["s"]], Min_Res_raw = trc$rules[["min_res"]],
+         t = tr[["t"]], s = tr[["s"]], Min_Res = tr[["min_res"]], Trade_Rule_Score = trc$obj, Signals_Used = trc$n,
+         Residual = if (isTRUE(ev$ok)) ev$resid else NA, Resid_SD = if (isTRUE(ev$ok)) ev$sigma else NA, Traded = trade,
+         BP_Stat = if (is.null(ev$bp_stat)) NA else ev$bp_stat, BP_p = if (is.null(ev$bp_p)) NA else ev$bp_p,
+         Var_Ratio = if (is.null(ev$var_ratio)) NA else ev$var_ratio, Max_VIF = if (is.null(ev$vif)) NA else max(ev$vif),
+         Lin_RESET_p = if (is.null(ev$lin)) NA_real_ else ev$lin$reset_p,
+         Lin_Share_Nonlinear = if (is.null(ev$lin$vars)) NA_real_ else mean(ev$lin$vars$Nonlinear),
+         Lin_Nonlinear_Vars = if (is.null(ev$lin$vars)) NA_character_ else paste(ev$lin$vars$Variable[ev$lin$vars$Nonlinear], collapse = "; "),
+         Transformed_Vars = if (is.null(ev$forms) || all(ev$forms == "Linear")) "" else
+           paste(sprintf("%s (%s)", D$vars[ev$sel][ev$forms != "Linear"], ev$forms[ev$forms != "Linear"]), collapse = "; "),
+         MK_Input_log2VR = mk_x[1], MK_Input_OOS_R2 = mk_x[2],
+         MK_Input_logVol = if (MK_METHOD == "hmm3") mk_x3[2] else NA_real_, MK_Input_RetDev = if (MK_METHOD == "hmm3b") mk_x3[1] else NA_real_,
+         MK_Input_R2_Slope = mk_x3[3],
+         MK_Regime = mk$regime %||% NA_character_, MK_Worst_Regime = mk$worst %||% NA_character_,
+         MK_Ensemble = mk$ens %||% NA_character_, MK_Ens_Low_Votes = mk$n_low %||% NA_integer_, MK_Calm = mk$calm %||% NA,
+         MK_Vol = mk$vol %||% NA_real_, MK_Action = mk$action %||% NA_integer_,
+         MK_Score = mk$score %||% NA_real_, MK_Threshold = mk$thr %||% NA_real_,
+         MK_P_bad = mk$p_bad, MK_State = mk$state))
+  state$m_next <- m + 1
+  el <- as.numeric(difftime(Sys.time(), t_start, units = "hours"))
+  log_line(format(D$dates[m], "%Y-%m"), sprintf(" | win %d/%d (raw %d/%d) | n %d | OOS R2 %.3f | t %.2f s %.2f MinRes %.2f | %s | %.2f h",
+           W_used$train, W_used$test, W$train, W$test, th_used$n, if (isTRUE(ev$ok)) ev$obj else NA, tr[["t"]], tr[["s"]], tr[["min_res"]],
+           if (trade) ifelse(ev$resid < 0, "BUY", "SELL") else "no trade", el))
+  if (m %% CHECKPOINT_EVERY == 0) saveRDS(list(signature = SIGNATURE, state = state), CK_FILE)
+}
+saveRDS(list(signature = SIGNATURE, state = state), CK_FILE)
+```
+
+# 10. Results
+
+```{r results}
+calib <- do.call(rbind, lapply(state$rows, as.data.frame)); calib$Date <- as.Date(paste0(calib$Month, "-01"))
+fmtp <- function(v, d = 2) ifelse(is.na(v), "-", sprintf(paste0("%.", d, "f%%"), 100 * v))
+dl <- Filter(function(x) x$trade, state$dec)
+fmt <- function(v) paste(sprintf("%.4g", v), collapse = "; ")
+if (length(dl)) {
+  ent <- vapply(dl, function(x) D$entry_idx[x$m], 0); dir <- vapply(dl, function(x) -sign(x$ev$resid), 0)
+  TPv <- vapply(dl, function(x) x$tr[["t"]] * abs(x$ev$resid), 0); SLv <- vapply(dl, function(x) x$tr[["s"]] * abs(x$ev$resid), 0)
+  st <- sim_trades(D, ent, dir, TPv, SLv, D$n_days)
+  trades <- data.frame(
+    Decision_Month = vapply(dl, function(x) format(D$dates[x$m], "%Y-%m"), ""),
+    OOS_R2 = vapply(dl, function(x) x$ev$obj, 0),                 # model fit (test window) behind this trade
+    Entry_Day = D$ddates[ent], Exit_Day = D$ddates[st$exit],
+    Variables_Used = vapply(dl, function(x) paste(D$vars[x$ev$sel], collapse = "; "), ""),
+    Var_Coefficients = vapply(dl, function(x) fmt(x$ev$coef), ""),
+    Var_PValues = vapply(dl, function(x) fmt(x$ev$pval), ""),
+    Var_PValues_Univariate = vapply(dl, function(x) fmt(x$ev$uni_p), ""),
+    Actual_Return = vapply(dl, function(x) x$ev$actual, 0), Fitted_Return = vapply(dl, function(x) x$ev$fitted, 0),
+    Actual_minus_Fitted = vapply(dl, function(x) x$ev$resid, 0), Resid_SD = vapply(dl, function(x) x$ev$sigma, 0),
+    Signal = ifelse(dir > 0, "BUY", "SELL"), TP = TPv, SL = -SLv, t = vapply(dl, function(x) x$tr[["t"]], 0),
+    s = vapply(dl, function(x) x$tr[["s"]], 0), Return = st$gross - 2 * COST_PER_SIDE, Exit_Reason = st$reason,
+    Hit = as.integer(st$gross - 2 * COST_PER_SIDE > 0),
+    Var_VIFs = vapply(dl, function(x) fmt(x$ev$vif), ""), Max_VIF = vapply(dl, function(x) max(x$ev$vif), 0),
+    BP_p = vapply(dl, function(x) if (is.null(x$ev$bp_p)) NA_real_ else x$ev$bp_p, 0),
+    Var_Ratio = vapply(dl, function(x) if (is.null(x$ev$var_ratio)) NA_real_ else x$ev$var_ratio, 0),
+    Lin_RESET_p = vapply(dl, function(x) if (is.null(x$ev$lin)) NA_real_ else x$ev$lin$reset_p, 0),
+    Lin_Nonlinear_Vars = vapply(dl, function(x) if (is.null(x$ev$lin$vars)) NA_character_ else
+      paste(x$ev$lin$vars$Variable[x$ev$lin$vars$Nonlinear], collapse = "; "), ""),
+    Transformed_Vars = vapply(dl, function(x) if (is.null(x$ev$forms) || all(x$ev$forms == "Linear")) "" else
+      paste(sprintf("%s (%s)", D$vars[x$ev$sel][x$ev$forms != "Linear"], x$ev$forms[x$ev$forms != "Linear"]), collapse = "; "), ""), check.names = FALSE)
+  trades$Days_Held <- st$exit - ent
+  trades$Trade_Sharpe <- vapply(seq_along(ent), function(i) {        # annualised Sharpe of the trade's daily returns while open
+    if (st$exit[i] - ent[i] < 5) return(NA_real_)
+    dr <- dir[i] * D$r[(ent[i] + 1):st$exit[i]]; s <- sd(dr)
+    if (!is.finite(s) || s <= 0) NA_real_ else mean(dr) / s * sqrt(252) }, 0)
+  done <- trades$Exit_Reason != "Open"
+  trades$Cum_Hit_Rate <- NA_real_; trades$Cum_Hit_Rate[done] <- cumsum(trades$Hit[done]) / seq_len(sum(done))
+  rp <- port_returns(D, ent, st$exit, dir, min(ent), D$n_days); days <- D$ddates[min(ent):D$n_days]; bh <- D$r[min(ent):D$n_days]
+} else { trades <- data.frame(Note = "No trades"); days <- D$ddates; rp <- numeric(length(days)); bh <- D$r }
+eq <- cumprod(1 + rp); eqb <- cumprod(1 + bh)
+stats_of <- function(r, e) { yrs <- length(r) / 252
+  c(e[length(e)]^(1 / yrs) - 1, sd(r) * sqrt(252), if (isTRUE(sd(r) > 0)) mean(r) / sd(r) * sqrt(252) else NA, min(e / cummax(e) - 1)) }
+ss <- stats_of(rp, eq); sb <- stats_of(bh, eqb); ntr <- if (length(dl)) nrow(trades) else 0
+perf <- data.frame(Metric = c("CAGR", "Annual volatility", "Sharpe", "Max drawdown", "Trades", "Hit rate", "Avg trade return",
+                              "Median OOS R2 (used parameters)"),
+  Strategy = c(sprintf("%.2f%%", 100 * ss[1:2]), sprintf("%.2f", ss[3]), sprintf("%.2f%%", 100 * ss[4]), ntr,
+               if (ntr) sprintf("%.1f%%", 100 * mean(trades$Hit)) else "-", if (ntr) sprintf("%.2f%%", 100 * mean(trades$Return)) else "-",
+               sprintf("%.3f", median(calib$OOS_R2_used, na.rm = TRUE))),
+  Buy_and_Hold = c(sprintf("%.2f%%", 100 * sb[1:2]), sprintf("%.2f", sb[3]), sprintf("%.2f%%", 100 * sb[4]), "-", "-", "-", "-"))
+perf
+if (ntr) as.data.frame(table(Exit_Reason = trades$Exit_Reason))
+```
+
+
+## Validation strategies
+
+With `VALIDATION_MODE = TRUE`, four strategies run side by side, all with the same calibration on the 24-month test window that ends `VAL_WIN` months before the trade month:
+
+- **Baseline:** the test-window winner, trading every signal.
+- **(a) Choose:** the candidate parameter set that holds up best on the `VAL_WIN`-month validation window.
+- **(b) Gate:** the test-window winner, trading only if its validation OOS R² is above `VAL_GATE`.
+- **(c) Choose + gate:** the best validation candidate, trading only if its validation OOS R² is above `VAL_GATE`.
+- **(d) Switch:** the best validation candidate (as in a) in months when the test-window winner's validation OOS R² is below 0, the test-window winner (as in Baseline) otherwise. The validation window ends at or before the trade month, so this uses no future data.
+
+Each strategy keeps its own signal history, `Min_Res` and smoothing. Portfolios are measured over the same dates.
+
+```{r strategies, eval = isTRUE(get0("VALIDATION_MODE"))}
+S_LAB <- c(base = "Baseline", a = "(a) Choose", b = "(b) Gate", c = "(c) Choose + gate", d = "(d) Switch")
+strat_trades <- function(decs) {
+  dl <- Filter(function(x) x$trade, decs); if (!length(dl)) return(NULL)
+  ent <- vapply(dl, function(x) D$entry_idx[x$m], 0); dir <- vapply(dl, function(x) -sign(x$ev$resid), 0)
+  TPv <- vapply(dl, function(x) x$tr[["t"]] * abs(x$ev$resid), 0); SLv <- vapply(dl, function(x) x$tr[["s"]] * abs(x$ev$resid), 0)
+  st <- sim_trades(D, ent, dir, TPv, SLv, D$n_days)
+  data.frame(Decision_Month = vapply(dl, function(x) format(D$dates[x$m], "%Y-%m"), ""), Entry_Day = D$ddates[ent], Exit_Day = D$ddates[st$exit],
+             Validation_OOS_R2 = vapply(dl, function(x) x$ev$obj, 0), Variables_Used = vapply(dl, function(x) paste(D$vars[x$ev$sel], collapse = "; "), ""),
+             Actual_minus_Fitted = vapply(dl, function(x) x$ev$resid, 0), Signal = ifelse(dir > 0, "BUY", "SELL"), TP = TPv, SL = -SLv,
+             Return = st$gross - 2 * COST_PER_SIDE, Exit_Reason = st$reason, Hit = as.integer(st$gross - 2 * COST_PER_SIDE > 0),
+             .e = ent, .x = st$exit, .d = dir, check.names = FALSE)
+}
+ST <- setNames(lapply(names(S_LAB), function(sn) strat_trades(state$strat[[sn]]$dec)), names(S_LAB))
+f0 <- min(unlist(lapply(ST, function(x) if (!is.null(x)) min(x$.e))))
+s_days <- D$ddates[f0:D$n_days]
+SRP <- lapply(ST, function(x) if (is.null(x)) numeric(D$n_days - f0 + 1) else port_returns(D, x$.e, x$.x, x$.d, f0, D$n_days))
+vlog <- do.call(rbind, state$vallog)
+s_stats <- function(sn) {
+  r <- SRP[[sn]]; x <- ST[[sn]]; e <- cumprod(1 + r); yrs <- length(r) / 252; cl <- if (is.null(x)) NULL else x[x$Exit_Reason != "Open", ]
+  c(Trades = if (is.null(cl)) 0 else nrow(cl), Hit = if (is.null(cl) || !nrow(cl)) NA else mean(cl$Hit),
+    Avg = if (is.null(cl) || !nrow(cl)) NA else mean(cl$Return), Sum = if (is.null(cl)) 0 else sum(cl$Return),
+    Total = e[length(e)] - 1, CAGR = e[length(e)]^(1 / yrs) - 1, Sharpe = if (sd(r) > 0) mean(r) / sd(r) * sqrt(252) else NA,
+    MaxDD = min(e / cummax(e) - 1))
+}
+SS <- sapply(names(S_LAB), s_stats)
+fmtp <- function(v, d = 2) ifelse(is.na(v), "-", sprintf(paste0("%.", d, "f%%"), 100 * v))
+strat_tab <- data.frame(Metric = c("Trades", "Hit rate", "Avg trade return", "Sum of trade returns", "Portfolio total return",
+                                   "CAGR", "Sharpe", "Max drawdown", "Months passing the validation gate"), check.names = FALSE)
+for (sn in names(S_LAB)) strat_tab[[S_LAB[[sn]]]] <- c(SS["Trades", sn], fmtp(SS["Hit", sn], 1), fmtp(SS["Avg", sn]), fmtp(SS["Sum", sn], 1),
+  fmtp(SS["Total", sn], 1), fmtp(SS["CAGR", sn]), sprintf("%.2f", SS["Sharpe", sn]), fmtp(SS["MaxDD", sn], 1),
+  if (sn == "b") fmtp(mean(vlog$Gate_b_pass), 0) else if (sn == "c") fmtp(mean(vlog$Gate_c_pass), 0)
+  else if (sn == "d") sprintf("uses (a) in %s", fmtp(mean(vlog$Switch_uses == "a (choose)"), 0)) else "-")
+strat_tab
+data.frame(Item = c("Months with a validation stage", "Candidates per month (average)", "Best validation candidate = test-window winner",
+                    "Median validation OOS R2 of the winner", "Median validation OOS R2 of the best candidate"),
+           Value = c(nrow(vlog), sprintf("%.1f", mean(vlog$Candidates)), fmtp(mean(vlog$Chosen_is_winner), 0),
+                     sprintf("%.3f", median(vlog$Val_R2_winner[is.finite(vlog$Val_R2_winner)])),
+                     sprintf("%.3f", median(vlog$Val_R2_best_candidate[is.finite(vlog$Val_R2_best_candidate)]))))
+```
+
+
+## Markov states
+
+With `MK_METHOD = "hmm3b"` (default): a 3-state Markov model on **VLO's return deviation** this month (z-score against the past `MK_DEV_MONTHS` months), the **variance ratio** and the **slope of the validation OOS R²** over `MK_B_SLOPE_MONTHS` months. The states are named by their variance ratio (low / mid / high), and `MK_BAD_REGIME_B` (default "low") is state 0.
+
+With `MK_METHOD = "hmm3"`: a **3-state Markov model** is fitted every month, on history up to that month, to three inputs: the **variance ratio** (log2), **VLO's realised volatility** over the last `MK_VOL_MONTHS` months (log) and the **slope of the validation OOS R²** over the last `MK_SLOPE_MONTHS` months. The states are named by their volatility (calm / normal / turbulent). By default (`MK_BAD_REGIME = "calm"`) the **calm (low-volatility) regime is state 0**, a choice fixed in advance because it was the weak regime in every earlier run; trade outcomes play no part. With `MK_BAD_REGIME = "learned"`, the trades already **closed** by then are grouped by the state they were made in; the state with the worst average (at least `MK_MIN_TRADES` trades) is state 0 and is skipped or flipped, **but only if that average is below `MK_BAD_BELOW` (default 0, i.e. it lost money)**; when every regime is profitable, everything trades. The direction is therefore learned from past results, not fixed in advance. With `MK_METHOD = "threshold"` or `"hmm"`, the description below applies.
+
+A 2-state Markov model is fitted every month, on the history up to that month, to a combined score of two inputs (each standardised on that history and added): the **variance ratio** (log2 of test / training residual variance, capped at ±4) and the **OOS R²** of the model behind the trade (the validation R² in validation mode; capped at −1…1). The "bad" state is the low-score state, i.e. both inputs low. The state is binary (1 = good, 0 = bad), switching to 0 when the filtered P(bad) exceeds `MK_ENTER` and back to 1 only below `MK_EXIT`. Signals and `Min_Res` do not depend on the state, so the three versions below trade exactly the same signals: **Baseline** trades all of them, **Markov skip** skips them in state 0, **Markov flip** reverses them in state 0.
+
+```{r markov, eval = isTRUE(get0("MARKOV_MODE"))}
+mk_trades <- function(decs, rule) {
+  act <- function(x) x$mk$action %||% 1L
+  dl <- Filter(function(x) x$trade && !(rule == "skip" && identical(x$mk$state, 0L)) && !(rule == "graded" && identical(act(x), 0L)), decs)
+  if (!length(dl)) return(NULL)
+  flip <- vapply(dl, function(x) (rule == "flip" && identical(x$mk$state, 0L)) || (rule == "graded" && identical(act(x), -1L)), TRUE)
+  ent <- vapply(dl, function(x) D$entry_idx[x$m], 0); dir <- vapply(dl, function(x) -sign(x$ev$resid), 0) * ifelse(flip, -1, 1)
+  TPo <- vapply(dl, function(x) x$tr[["t"]] * abs(x$ev$resid), 0); SLo <- vapply(dl, function(x) x$tr[["s"]] * abs(x$ev$resid), 0)
+  TPv <- ifelse(flip, SLo, TPo); SLv <- ifelse(flip, TPo, SLo)                      # a reversed trade swaps its TP and SL distances
+  st <- sim_trades(D, ent, dir, TPv, SLv, D$n_days)
+  data.frame(Decision_Month = vapply(dl, function(x) format(D$dates[x$m], "%Y-%m"), ""), Entry_Day = D$ddates[ent], Exit_Day = D$ddates[st$exit],
+             State = vapply(dl, function(x) x$mk$state, 0L), P_bad = vapply(dl, function(x) x$mk$p_bad, 0), Flipped = flip,
+             Signal = ifelse(dir > 0, "BUY", "SELL"), Return = st$gross - 2 * COST_PER_SIDE, Exit_Reason = st$reason,
+             Hit = as.integer(st$gross - 2 * COST_PER_SIDE > 0), .e = ent, .x = st$exit, .d = dir, check.names = FALSE)
+}
+MK_LAB <- c(base = "Baseline", skip = "Markov skip", flip = "Markov flip")
+MKT <- list(base = mk_trades(state$dec, "none"), skip = mk_trades(state$dec, "skip"), flip = mk_trades(state$dec, "flip"))
+mf0 <- min(unlist(lapply(MKT, function(x) if (!is.null(x)) min(x$.e)))); mk_days <- D$ddates[mf0:D$n_days]
+MKR <- lapply(MKT, function(x) if (is.null(x)) numeric(D$n_days - mf0 + 1) else port_returns(D, x$.e, x$.x, x$.d, mf0, D$n_days))
+mk_row <- function(k) { x <- MKT[[k]]; r <- MKR[[k]]; e <- cumprod(1 + r); cl <- if (is.null(x)) x else x[x$Exit_Reason != "Open", ]
+  half <- function(a, b) if (is.null(cl)) 0 else sum(cl$Return[substr(cl$Decision_Month, 1, 4) >= a & substr(cl$Decision_Month, 1, 4) <= b])
+  c(if (is.null(cl)) 0 else nrow(cl), if (is.null(cl)) NA else mean(cl$Hit), if (is.null(cl)) NA else mean(cl$Return),
+    half("0000", "2019"), half("2020", "9999"), e[length(e)] - 1, e[length(e)]^(252 / length(r)) - 1,
+    if (sd(r) > 0) mean(r) / sd(r) * sqrt(252) else NA, min(e / cummax(e) - 1)) }
+MS <- sapply(names(MK_LAB), mk_row)
+mks <- calib[, intersect(c("Month", "Date", "MK_Input_log2VR", "MK_Input_OOS_R2", "MK_Input_logVol", "MK_Input_RetDev", "MK_Input_R2_Slope", "MK_Regime",
+                 "MK_Ensemble", "MK_Ens_Low_Votes", "MK_Calm", "MK_Vol", "MK_Action",
+                 "MK_Worst_Regime", "MK_Score", "MK_Threshold", "MK_P_bad", "MK_State"), names(calib))]
+mk_tab <- data.frame(Metric = c("Trades", "Hit rate", "Avg trade return", "Sum of trade returns, before 2020", "Sum of trade returns, 2020 onwards",
+                                "Portfolio total return", "CAGR", "Sharpe", "Max drawdown"), check.names = FALSE)
+for (k in names(MK_LAB)) mk_tab[[MK_LAB[[k]]]] <- c(MS[1, k], fmtp(MS[2, k], 1), fmtp(MS[3, k]), fmtp(MS[4, k], 1), fmtp(MS[5, k], 1),
+                                                  fmtp(MS[6, k], 1), fmtp(MS[7, k]), sprintf("%.2f", MS[8, k]), fmtp(MS[9, k], 1))
+mk_tab
+LBL3 <- if (MK_METHOD == "hmm3b") c("low", "mid", "high") else c("calm", "normal", "turbulent")
+if (MK_METHOD %in% c("hmm3", "hmm3b")) {
+  rg <- data.frame(Decision_Month = vapply(state$dec, function(x) format(D$dates[x$m], "%Y-%m"), ""),
+                   Regime = vapply(state$dec, function(x) x$mk$regime %||% NA_character_, ""))
+  bt3 <- merge(MKT$base[MKT$base$Exit_Reason != "Open", ], rg, by = "Decision_Month")
+  bt3$Period <- ifelse(substr(bt3$Decision_Month, 1, 4) < "2020", "before 2020", "2020 onwards")
+  reg_tab <- do.call(rbind, lapply(LBL3, function(r) {
+    one <- function(per) { x <- bt3[bt3$Regime %in% r & (per == "all" | bt3$Period == per), ]
+      if (!nrow(x)) "-" else sprintf("%d trades, avg %s, hit %s", nrow(x), fmtp(mean(x$Return)), fmtp(mean(x$Hit), 0)) }
+    data.frame(Regime = r, `Months in regime` = sum(mks$MK_Regime %in% r), `Before 2020` = one("before 2020"),
+               `2020 onwards` = one("2020 onwards"), All = one("all"),
+               `Avg variance ratio (log2)` = round(mean(mks$MK_Input_log2VR[mks$MK_Regime %in% r], na.rm = TRUE), 2),
+               `Avg volatility` = if (MK_METHOD == "hmm3") fmtp(mean(exp(mks$MK_Input_logVol[mks$MK_Regime %in% r]), na.rm = TRUE), 0) else "-",
+               `Avg first input (reversion corr. or return z)` = if (MK_METHOD == "hmm3b") round(mean(mks$MK_Input_RetDev[mks$MK_Regime %in% r], na.rm = TRUE), 2) else NA,
+               `Avg R2 slope / month` = round(mean(mks$MK_Input_R2_Slope[mks$MK_Regime %in% r], na.rm = TRUE), 3), check.names = FALSE)
+  }))
+}
+if (exists("reg_tab")) reg_tab
+if (MK_METHOD == "hmm3b" && "MK_Action" %in% names(calib)) {
+  ac <- data.frame(Decision_Month = calib$Month, Action = calib$MK_Action)
+  bta <- merge(MKT$base[MKT$base$Exit_Reason != "Open", ], ac, by = "Decision_Month")
+  bta$Period <- ifelse(substr(bta$Decision_Month, 1, 4) < "2020", "before 2020", "2020 onwards")
+  act_tab <- do.call(rbind, lapply(c(1, 0, -1), function(a) {
+    one <- function(per) { x <- bta[bta$Action %in% a & (per == "all" | bta$Period == per), ]
+      if (!nrow(x)) "-" else sprintf("%d trades, avg %s, hit %s", nrow(x), fmtp(mean(x$Return)), fmtp(mean(x$Hit), 0)) }
+    data.frame(`Graded action` = c(`1` = "trade", `0` = "skip", `-1` = "flip")[[as.character(a)]],
+               Months = sum(calib$MK_Action %in% a), `Baseline trades before 2020` = one("before 2020"),
+               `Baseline trades 2020 onwards` = one("2020 onwards"), All = one("all"), check.names = FALSE) }))
+  act_tab
+}
+if (exists("reg_tab")) data.frame(Item = c("Regime currently treated as bad (state 0)", "Months where a losing regime existed", "Regime switches"),
+             Value = c(tail(mks$MK_Worst_Regime, 1) %||% "-", sum(!is.na(mks$MK_Worst_Regime)), sum(head(mks$MK_Regime, -1) != tail(mks$MK_Regime, -1), na.rm = TRUE)))
+bt <- MKT$base[MKT$base$Exit_Reason != "Open", ]
+data.frame(Item = c("Months in state 0 (bad)", "State switches", "Baseline avg trade in state 1 / state 0",
+                    "Baseline hit rate in state 1 / state 0", "Typical length of bad / good state (last fit)"),
+           Value = c(sprintf("%d of %d (%.0f%%)", sum(mks$MK_State == 0), nrow(mks), 100 * mean(mks$MK_State == 0)), sum(diff(mks$MK_State) != 0),
+                     sprintf("%s (%d trades) / %s (%d trades)", fmtp(mean(bt$Return[bt$State == 1])), sum(bt$State == 1), fmtp(mean(bt$Return[bt$State == 0])), sum(bt$State == 0)),
+                     sprintf("%s / %s", fmtp(mean(bt$Hit[bt$State == 1]), 0), fmtp(mean(bt$Hit[bt$State == 0]), 0)),
+                     { lr <- state$dec[[length(state$dec)]]$mk; if (MK_METHOD %in% c("hmm3", "hmm3b")) sprintf(paste0("%s months (", paste(LBL3, collapse = " / "), ", last fit)"),
+                         paste(round(1 / (1 - (lr$stay %||% rep(NA, 3)))), collapse = " / ")) else if (MK_METHOD == "hmm") sprintf("%.0f / %.0f months", 1 / (1 - lr$stay_bad), 1 / (1 - lr$stay_good))
+                       else { rl <- rle(mks$MK_State); sprintf("%.1f / %.1f months (average run, threshold method)", mean(rl$lengths[rl$values == 0]), mean(rl$lengths[rl$values == 1])) } }))
+```
+
+## Combined models: validation strategy × Markov rule
+
+Every validation strategy combined with every Markov rule, on the same months. The Markov state of a month is the same for all strategies (it is computed once, from the baseline model's inputs); each strategy keeps its own signals. The **combined model** (`COMBINED_STRATEGY` + `COMBINED_MARKOV`) is shown separately below.
+
+```{r combined, eval = isTRUE(get0("MARKOV_MODE")) && exists("mk_trades")}
+SL5 <- c(base = "Baseline", a = "(a) Choose", b = "(b) Gate", c = "(c) Choose + gate", d = "(d) Switch")
+mk_by_m <- setNames(lapply(state$dec, function(x) x$mk), vapply(state$dec, function(x) as.character(x$m), ""))
+attach_mk <- function(decs) lapply(decs, function(x) { x$mk <- mk_by_m[[as.character(x$m)]] %||% list(state = 1L); x })
+SN <- if (isTRUE(VALIDATION_MODE) && length(state$strat)) names(SL5) else "base"
+decs_of <- function(sn) if (sn == "base" && !(isTRUE(VALIDATION_MODE) && length(state$strat))) state$dec else attach_mk(state$strat[[sn]]$dec)
+RULES <- c(none = "No Markov", skip = "Markov skip", flip = "Markov flip", graded = "Markov graded")
+CG <- list(); for (sn in SN) for (ru in names(RULES)) CG[[paste(sn, ru)]] <- mk_trades(decs_of(sn), ru)
+cf0 <- min(unlist(lapply(CG, function(x) if (!is.null(x)) min(x$.e)))); c_days <- D$ddates[cf0:D$n_days]
+CR <- lapply(CG, function(x) if (is.null(x)) numeric(D$n_days - cf0 + 1) else port_returns(D, x$.e, x$.x, x$.d, cf0, D$n_days))
+c_stats <- function(k) { x <- CG[[k]]; r <- CR[[k]]; e <- cumprod(1 + r); cl <- if (is.null(x)) NULL else x[x$Exit_Reason != "Open", ]
+  half <- function(a, b) if (is.null(cl)) 0 else sum(cl$Return[substr(cl$Decision_Month, 1, 4) >= a & substr(cl$Decision_Month, 1, 4) <= b])
+  data.frame(Trades = if (is.null(cl)) 0 else nrow(cl), `Hit rate` = if (is.null(cl)) "-" else fmtp(mean(cl$Hit), 1),
+             `Avg trade` = if (is.null(cl)) "-" else fmtp(mean(cl$Return)), `Sum before 2020` = fmtp(half("0000", "2019"), 1),
+             `Sum 2020 onwards` = fmtp(half("2020", "9999"), 1), CAGR = fmtp(e[length(e)]^(252 / length(r)) - 1),
+             Sharpe = round(if (sd(r) > 0) mean(r) / sd(r) * sqrt(252) else NA, 2), `Max drawdown` = fmtp(min(e / cummax(e) - 1), 1), check.names = FALSE) }
+comb_grid <- do.call(rbind, lapply(names(CG), function(k) { p2 <- strsplit(k, " ")[[1]]
+  cbind(data.frame(Strategy = SL5[[p2[1]]], Markov = RULES[[p2[2]]], check.names = FALSE), c_stats(k)) }))
+comb_grid$Combined <- ifelse(names(CG) == paste(COMBINED_STRATEGY, COMBINED_MARKOV), "<- combined model", "")
+comb_grid
+ck <- paste(COMBINED_STRATEGY, COMBINED_MARKOV)
+if (!ck %in% names(CG)) { cat("Combined model", ck, "not available (check VALIDATION_MODE / MARKOV_MODE); using Baseline + no Markov.\n"); ck <- "base none" }
+```
+
+### Combined model
+
+```{r combined-headline, eval = exists("CG")}
+comb_head <- rbind(cbind(data.frame(Model = "Baseline (no Markov)"), c_stats("base none")),
+                   cbind(data.frame(Model = sprintf("Combined: %s + %s", SL5[[strsplit(ck, " ")[[1]][1]]], RULES[[strsplit(ck, " ")[[1]][2]]])), c_stats(ck)))
+comb_head
+```
+
+```{r compare-save, include=FALSE}
+# Everything section 13 needs from this stock's run (read back by the RUN_ALL render).
+cmp <- if (exists("CR") && is.character(ck) && ck %in% names(CR)) {
+  list(days = c_days, base = CR[["base none"]], comb = CR[[ck]], bh = D$r[cf0:D$n_days], trades = CG[[ck]], trades_base = CG[["base none"]],
+       comb_label = sprintf("%s + %s", SL5[[strsplit(ck, " ")[[1]][1]]], RULES[[strsplit(ck, " ")[[1]][2]]]))
+} else list(days = days, base = rp, comb = rp, bh = bh, trades = NULL, trades_base = NULL, comb_label = "Baseline (no Markov)")
+cmp$stock <- STOCK; cmp$generated <- Sys.time(); cmp$data_from <- MON$dates[which(is.finite(MON$y))[1]]
+saveRDS(cmp, file.path(OUT_DIR, "compare.rds"))
+```
+
+# 10c. Rolling linearity check of the model
+
+Every month the check runs on **the model actually used for that month's signal**: its selected variables, on its own training window (all before the test window, so no lookahead). Three tests:
+
+- **RESET (whole model):** does adding fitted² and fitted³ to the regression improve it (F-test)? A small p-value means the straight-line model is misspecified that month.
+- **x² per variable:** does adding the variable's square to the full regression help? Bonferroni within the model: p < `LIN_P` / (number of variables).
+- **Transform swap per variable:** the variable is replaced by its signed log or signed square root (scaled by its median |x| in the training window), and the model's adjusted R² is compared. A variable counts as non-linear when the best transform gains ≥ `LIN_GAIN` or the x² test rejects.
+
+With `TRANSFORM_MODE = "report"` this is a report and trades are unchanged. With `"adaptive"` the result is used: each month, a selected variable whose signed log or signed sqrt raises the model's adjusted R² by at least `LIN_GAIN` on the training window enters the model in that form (the forms together must also beat the all-linear model). The decision uses training data only and applies everywhere the model is evaluated: calibration, validation, Markov inputs and trades. The tests below always describe the linear form of the model, so they show why a variable was transformed.
+
+```{r linearity, eval = !identical(get0("TRANSFORM_MODE"), "none")}
+r2_of <- function(x, y) { ok <- is.finite(x) & is.finite(y); if (sum(ok) < 24 || var(x[ok]) <= 0) return(NA_real_); suppressWarnings(cor(x[ok], y[ok])^2) }
+ld <- Filter(function(x) isTRUE(x$ev$ok) && !is.null(x$ev$lin$vars), state$dec)
+lin_roll <- do.call(rbind, lapply(ld, function(x) data.frame(Month = format(D$dates[x$m], "%Y-%m"), Model_RESET_p = x$ev$lin$reset_p,
+                                                             x$ev$lin$vars, Traded = x$trade, row.names = NULL)))
+if (!is.null(lin_roll) && nrow(lin_roll)) {
+  lin <- do.call(rbind, lapply(split(lin_roll, lin_roll$Variable), function(v) {
+    nl <- v[v$Nonlinear, ]; bf <- if (nrow(nl)) names(which.max(table(nl$Best_form))) else "Linear"
+    data.frame(Variable = v$Variable[1], Months_selected = nrow(v), Months_nonlinear = nrow(nl), Share_nonlinear = nrow(nl) / nrow(v),
+               Most_common_form_when_nonlinear = bf, Median_AdjR2_gain = median(v$AdjR2_gain, na.rm = TRUE),
+               Median_P_x2 = median(v$P_x2, na.rm = TRUE), First_month = min(v$Month), Last_month = max(v$Month)) }))
+  lin <- lin[order(-lin$Months_nonlinear, -lin$Share_nonlinear), ]; rownames(lin) <- NULL
+  mon_lin <- unique(lin_roll[, c("Month", "Model_RESET_p")])
+  mon_lin$Share <- tapply(lin_roll$Nonlinear, lin_roll$Month, mean)[mon_lin$Month]
+  data.frame(Item = c("Months checked", "Months where the model fails RESET (p < LIN_P)", "Selected variables flagged non-linear (share of variable-months)",
+                      "Variables ever selected / ever flagged", "Most common better form (flagged cases): signed log / signed sqrt / x^2 only"),
+             Value = c(nrow(mon_lin), sprintf("%d (%.0f%%)", sum(mon_lin$Model_RESET_p < LIN_P, na.rm = TRUE), 100 * mean(mon_lin$Model_RESET_p < LIN_P, na.rm = TRUE)),
+                       sprintf("%.0f%%", 100 * mean(lin_roll$Nonlinear)), sprintf("%d / %d", nrow(lin), sum(lin$Months_nonlinear > 0)),
+                       paste(sum(lin_roll$Nonlinear & lin_roll$Best_form == "Signed log"), sum(lin_roll$Nonlinear & lin_roll$Best_form == "Signed sqrt"),
+                             sum(lin_roll$Nonlinear & lin_roll$Best_form == "Linear"), sep = " / ")))
+  if (TRANSFORM_MODE == "adaptive" && "Transformed_Vars" %in% names(calib))
+    print(data.frame(Item = c("Months with at least one transformed variable", "Of which traded"),
+                     Value = c(sprintf("%d of %d", sum(calib$Transformed_Vars != ""), nrow(calib)), sum(calib$Transformed_Vars != "" & calib$Traded))))
+  head(transform(lin[lin$Months_nonlinear > 0, c("Variable", "Months_selected", "Months_nonlinear", "Most_common_form_when_nonlinear", "Median_AdjR2_gain")],
+                 Median_AdjR2_gain = round(Median_AdjR2_gain, 3)), 15)
+}
+```
+
+# 10b. Forward check: raw vs smoothed parameters
+
+**This section uses future data for evaluation only.** It never feeds back into any decision, parameter or trade above.
+
+The OOS R² in the calibration table is measured on the same test window the raw parameters were optimised on, so it always favours them. This check is fair to both. The parameters chosen at month *t* (raw and smoothed) are applied `Test_Win` months later, so their test window covers the months **from *t* onward**: months that neither set was tuned on. Everything else stays as the model does it: selection at the end of the training window, fit on the training window, OOS R² against the training mean.
+
+```{r forward-check}
+if (SMOOTHING == "none") {
+  cat("Not applicable: SMOOTHING = \"none\", so the parameters used are the raw calibration (nothing to compare).")
+  unlink(file.path(OUT_DIR, "08_forward_oos_r2.png"))   # remove a chart left over from an earlier smoothed run
+} else {
+nw_t <- function(x, L) {                       # t-stat of a mean with Newey-West errors (overlapping windows)
+  x <- x[is.finite(x)]; n <- length(x); if (n < 10) return(NA_real_)
+  u <- x - mean(x); v <- sum(u^2) / n
+  for (l in seq_len(min(L, n - 1))) v <- v + 2 * (1 - l / (L + 1)) * sum(u[(l + 1):n] * u[1:(n - l)]) / n
+  mean(x) / sqrt(v / n)
+}
+fwd <- do.call(rbind, lapply(state$rows, function(x) {
+  m <- match(x$Month, format(D$dates, "%Y-%m"))
+  Wr <- list(train = x$Train_Win_raw, test = x$Test_Win_raw); Wu <- list(train = x$Train_Win, test = x$Test_Win)
+  th_raw <- add_fixed(setNames(lapply(SPEC$name, function(p) x[[paste0(p, "_raw")]]), SPEC$name)); th_used <- add_fixed(x[SPEC$name])
+  f <- function(th, W) { m2 <- m + W$test; if (m2 > D$Tn) NA_real_ else { ev <- model_eval(D, th, W, m2); if (isTRUE(ev$ok)) ev$obj else NA_real_ } }
+  data.frame(Month = x$Month, Test_Win = Wu$test, Calib_Window_R2_raw = x$OOS_R2_raw, Calib_Window_R2_used = x$OOS_R2_used,
+             Forward_R2_raw = f(th_raw, Wr), Forward_R2_used = f(th_used, Wu))
+}))
+fwd$Forward_Diff_used_minus_raw <- fwd$Forward_R2_used - fwd$Forward_R2_raw
+ok <- is.finite(fwd$Forward_R2_raw) & is.finite(fwd$Forward_R2_used); L <- round(median(fwd$Test_Win))
+fwd_summary <- data.frame(
+  Measure = c("Months compared", "Calibration window: mean OOS R2 (raw / smoothed)", "FORWARD: mean OOS R2 (raw / smoothed)",
+              "FORWARD: median OOS R2 (raw / smoothed)", "FORWARD: months where smoothed beats raw",
+              "FORWARD: mean difference (smoothed - raw)", "FORWARD: t-stat of the difference (Newey-West)"),
+  Value = c(sum(ok),
+            sprintf("%.3f / %.3f", mean(fwd$Calib_Window_R2_raw[ok], na.rm = TRUE), mean(fwd$Calib_Window_R2_used[ok], na.rm = TRUE)),
+            sprintf("%.3f / %.3f", mean(fwd$Forward_R2_raw[ok]), mean(fwd$Forward_R2_used[ok])),
+            sprintf("%.3f / %.3f", median(fwd$Forward_R2_raw[ok]), median(fwd$Forward_R2_used[ok])),
+            sprintf("%.0f%%", 100 * mean(fwd$Forward_Diff_used_minus_raw[ok] > 0)),
+            sprintf("%+.4f", mean(fwd$Forward_Diff_used_minus_raw[ok])),
+            sprintf("%.2f", nw_t(fwd$Forward_Diff_used_minus_raw[ok], L))))
+fwd_summary
+}
+```
+
+A t-stat above +2 means the smoothed parameters generalise better; below −2, the raw ones do. In between, the difference isn't reliable. Consecutive months share most of their forward window, so the t-stat uses Newey-West errors.
+
+
+# 11. Excel export
+
+```{r excel}
+th_by_month <- vector("list", D$Tn); for (x in state$rows) th_by_month[[match(x$Month, format(D$dates, "%Y-%m"))]] <- add_fixed(x[SPEC$name])
+fill <- th_by_month[[which(!vapply(th_by_month, is.null, TRUE))[1]]]
+for (m in seq_len(D$Tn)) if (is.null(th_by_month[[m]])) th_by_month[[m]] <- fill
+as_used <- function(getter, keyf) {
+  keys <- vapply(th_by_month, keyf, ""); out <- matrix(NA_real_, D$V, D$Tn)
+  for (k in unique(keys)) { ms <- which(keys == k); mat <- getter(th_by_month[[ms[1]]]); out[, ms] <- t(mat[ms, , drop = FALSE]) }
+  df <- data.frame(Variable = D$vars, out, check.names = FALSE); names(df)[-1] <- format(D$dates, "%Y-%m"); df
+}
+kR <- function(th) paste(th$Regr_Win); kRZ <- function(th) paste(th$Regr_Win, th$Z_Win)
+kO <- function(th) paste(th$Train_MO, th$Test_MO); kOZ <- function(th) paste(th$Train_MO, th$Test_MO, th$Z_Win)
+sheets <- list(P_Values = as_used(function(th) reg_sheet(D, th$Regr_Win)$P, kR),
+               Adj_R2 = as_used(function(th) reg_sheet(D, th$Regr_Win)$AdjR2, kR),
+               Coef_Values = as_used(function(th) reg_sheet(D, th$Regr_Win)$Coef, kR),
+               P_Standardized = as_used(function(th) reg_sheet(D, th$Regr_Win)$Pstd, kR),
+               Z_P_Standardized = as_used(function(th) zreg_sheet(D, th$Regr_Win, th$Z_Win)$zP, kRZ),
+               Z_Adj_R2 = as_used(function(th) zreg_sheet(D, th$Regr_Win, th$Z_Win)$zA, kRZ),
+               Z_Coef_Values = as_used(function(th) zreg_sheet(D, th$Regr_Win, th$Z_Win)$zC, kRZ),
+               OOS_R2 = as_used(function(th) oos_sheet(D, th$Train_MO, th$Test_MO), kO),
+               Z_OOS_R2 = as_used(function(th) zoos_sheet(D, th$Train_MO, th$Test_MO, th$Z_Win), kOZ))
+sel_all <- unlist(lapply(state$dec, function(x) if (isTRUE(x$ev$ok)) D$vars[x$ev$sel]))
+usage <- if (length(sel_all)) { tb <- sort(table(sel_all), decreasing = TRUE); data.frame(Variable = names(tb), Months_Selected = as.integer(tb)) } else
+  data.frame(Variable = character(0), Months_Selected = integer(0))
+reasons <- do.call(rbind, lapply(state$dec, function(x) data.frame(Month = format(D$dates[x$m], "%Y-%m"),
+  OOS_R2 = if (isTRUE(x$ev$ok)) x$ev$obj else NA,
+  Reason = if (x$trade) "Trade" else if (!isTRUE(x$ev$ok)) "Model not available (history / data)" else if (!is.finite(x$ev$resid)) "Month t data missing"
+           else if (is.na(D$entry_idx[x$m])) "No entry day in daily data" else "Residual below Min_Res x SD",
+  Residual = if (isTRUE(x$ev$ok)) x$ev$resid else NA, Threshold = if (isTRUE(x$ev$ok)) x$tr[["min_res"]] * x$ev$sigma else NA)))
+PAR_USED <- c("Month", "Train_Win", "Test_Win", "Train_Win_raw", "Test_Win_raw", "n_max", unique(c(SPEC$name[!SPEC$name %in% WEIGHTS], names(FIXED_PARAMS))), "OOS_R2_raw", "OOS_R2_used")
+COEF_USED <- c("Month", WEIGHTS, "t", "s", "Min_Res", "t_raw", "s_raw", "Min_Res_raw", "Trade_Rule_Score", "Signals_Used")
+
+wb <- openxlsx::createWorkbook()
+hs <- openxlsx::createStyle(textDecoration = "bold", fontColour = "#FFFFFF", fgFill = "#1F3A5F", halign = "center")
+add <- function(name, df) { openxlsx::addWorksheet(wb, name); openxlsx::writeData(wb, name, df, headerStyle = hs)
+  openxlsx::freezePane(wb, name, firstRow = TRUE, firstCol = TRUE); openxlsx::setColWidths(wb, name, 1, 24) }
+add("Info", data.frame(Item = c("Generated", "Smoothing (parameter table)", "Calibration ranges (parameter table)", "Warm start / starting point", "Seed", "Markov method / state 0", "Markov settings", "Forecast shrink / combination", "Functional form", "Forced variables (economic core)", "Variable ranking", "Shortest windows (Regr / Z / Train_MO / Test_MO)", "Calibration objective windows", "Score weights", "Fixed parameters", "Variables (n)", "Window ranges (train / test)", "Quick mode", "Entry", "Smoothing", "Calibration test window", "Window pair update",
+                                "Window pairs fully calibrated", "Local polish rounds", "Objective (model)", "Objective (trade rules)",
+                                "TP / SL", "Max hold (months)", "Data file", "Stock / daily file"),
+  Value = c(format(Sys.time()),
+            if (!LAYER2) "off (all raw)" else paste(vapply(names(SMOOTH_SPEC), function(n) { x <- SMOOTH_SPEC[[n]]
+              sprintf("%s: %s%s", n, x$method, if (x$method == "none") "" else sprintf(" (%s)", if (is.finite(x$months)) x$months else "all history")) }, ""),
+              collapse = "; "),
+            paste(c(sprintf("%s %s-%s", names(PARAM_MAX), PARAM_MIN[names(PARAM_MAX)], PARAM_MAX), sprintf("n %s-%s", N_RANGE[1], N_RANGE[2]),
+                    sprintf("Corr_t %s-%s", CORR_RANGE[1], CORR_RANGE[2]),
+                    sprintf("%s %s-%s", WEIGHTS, W_RANGE[WEIGHTS, 1], W_RANGE[WEIGHTS, 2]), sprintf("Min_Res %s-%s", min(MINRES_GRID), max(MINRES_GRID)),
+                    sprintf("Train_Win %s-%s", TRAIN_WIN_RANGE[1], TRAIN_WIN_RANGE[2]), sprintf("Test_Win %s-%s", TEST_WIN_RANGE[1], TEST_WIN_RANGE[2])), collapse = "; "),
+            paste0(WARM_START, "; starting point: ", START_DESC), SEED,
+            if (MARKOV_MODE) sprintf("%s / %s", MK_METHOD, paste(if (MK_METHOD == "hmm3b") MK_BAD_REGIME_B else if (MK_METHOD == "hmm3") MK_BAD_REGIME else "score below threshold", collapse = "+")) else "off",
+            if (MARKOV_MODE) sprintf("min history %s; history window %s; first input %s (%s); R2 slope %s m; ensemble %s m, flip votes %s, skip votes %s, calm %s; combined rule %s",
+              MK_MIN_HIST, MK_HIST_WIN, MK_INPUT1, MK_DEV_MONTHS, MK_B_SLOPE_MONTHS, paste(MK_ENS_WINDOWS, collapse = "/"), MK_FLIP_VOTES, MK_SKIP_VOTES,
+              MK_USE_CALM, get0("COMBINED_MARKOV", ifnotfound = "-")) else "off",
+            sprintf("shrink %s; variables: %s; training windows: %s", SHRINK, COMBINE_VARS,
+              if (COMBINE_TRAIN > 0) sprintf("+/- %s months of the chosen one", COMBINE_TRAIN) else "chosen one only"),
+            switch(TRANSFORM_MODE, none = "linear, no check", report = sprintf("linear; rolling check reported (p %s, gain %s)", LIN_P, LIN_GAIN),
+                   adaptive = sprintf("adaptive: signed log / sqrt per variable when adj. R2 gain >= %s on the training window", LIN_GAIN),
+                   candidates = "transformed versions added as candidates", TRANSFORM_MODE),
+            if (length(FORCE_VARS)) paste0(paste(FORCE_VARS, collapse = ", "), if (length(setdiff(FORCE_VARS, D$vars))) "  (some NOT FOUND in data)" else "") else "none",
+            sprintf("score %s; %s", if (SCORE_AVG_MONTHS > 1) sprintf("averaged over the last %d months", as.integer(SCORE_AVG_MONTHS)) else "this month only",
+                    paste0(if (SIGN_MIN > 0) sprintf("coefficient sign unchanged in >= %.0f%% of the last %d months", 100 * SIGN_MIN, as.integer(SIGN_MONTHS)) else "no sign filter",
+                           if (P_MAX < 1) sprintf("; own p-value < %s", P_MAX) else "; no p-value filter")),
+            paste(PARAM_MIN[c("Regr_Win", "Z_Win", "Train_MO", "Test_MO")], collapse = " / "),
+            sprintf("%d past test windows (most recent weight %s)", OBJ_WINDOWS, OBJ_RECENT_WEIGHT),
+            sprintf("%s (%s)", paste(WEIGHTS, collapse = ", "), WEIGHT_MODE),
+            if (length(FIXED_PARAMS)) paste(sprintf("%s = %s", names(FIXED_PARAMS), unlist(FIXED_PARAMS)), collapse = "; ") else "none (all calibrated)", paste(N_RANGE, collapse = " to "),
+            sprintf("%d-%d / %d-%d months", TRAIN_WIN_RANGE[1], TRAIN_WIN_RANGE[2], TEST_WIN_RANGE[1], TEST_WIN_RANGE[2]), QUICK_MODE, if (ENTRY_DAY == 0) "close of signal month" else sprintf("close of trading day %d of next month", ENTRY_DAY),
+            SMOOTHING, if (TEST_INCLUDES_TRADE_MONTH) "ends at trade month" else "ends at t-1", WINDOW_UPDATE,
+            sprintf("top %d + current", WINDOW_TOP_K), POLISH_ROUNDS, "Out-of-sample R2 of the nowcast",
+            "Min_Res only: return x Sharpe (negative return if losing)", sprintf("fixed at %.2f / %.2f x |residual|", FIXED_T, FIXED_S),
+            MAX_HOLD_M, DATA_FILE, sprintf("%s / %s%s%s", STOCK, DAILY_FILE, if (Y_FROM_DAILY) " (monthly returns and own-return variables from the daily file)" else "",
+                    if (!is.na(DS)) sprintf("; returns before %s ignored (history test)", format(DS, "%Y-%m")) else ""))))
+for (nm in names(sheets)) add(nm, sheets[[nm]])
+add("Calib_Parameters", calib[, PAR_USED]); add("Calib_Coefficients", calib[, COEF_USED])
+add("Calib_Raw", calib); add("Window_Choices", do.call(rbind, state$winlog))
+add("Trades", trades); add("No_Trade_Reasons", reasons); add("Performance", perf); add("Variable_Usage", usage)
+if (exists("fwd")) { add("Forward_Check", fwd); add("Forward_Summary", fwd_summary) }
+if (exists("lin")) { add("Linearity", lin); add("Linearity_Rolling", lin_roll) }
+if (exists("reg_tab")) add("Markov_Regimes", reg_tab)
+if (exists("act_tab")) add("Markov_Graded_Actions", act_tab)
+if (exists("comb_grid")) { add("Combined_Grid", comb_grid); add("Combined_Model", comb_head)
+  add("Trades_combined", if (is.null(CG[[ck]])) data.frame(Note = "No trades") else CG[[ck]][, !startsWith(names(CG[[ck]]), ".")]) }
+if (exists("mk_tab")) { add("Markov_Strategies", mk_tab); add("Markov_States", mks[, names(mks) != "Date"])
+  for (k in c("skip", "flip")) add(paste0("Trades_markov_", k), if (is.null(MKT[[k]])) data.frame(Note = "No trades") else MKT[[k]][, !startsWith(names(MKT[[k]]), ".")]) }
+add("Diagnostics", calib[, intersect(c("Month", "BP_Stat", "BP_p", "Var_Ratio", "Max_VIF", "Lin_RESET_p", "Lin_Share_Nonlinear",
+                                       "Lin_Nonlinear_Vars", "Transformed_Vars", "OOS_R2_used", "Traded"), names(calib))])
+if (VALIDATION_MODE && exists("strat_tab")) {
+  add("Strategies", strat_tab); add("Validation", vlog)
+  for (sn in c("a", "b", "c", "d")) add(paste0("Trades_", sn), if (is.null(ST[[sn]])) data.frame(Note = "No trades") else ST[[sn]][, !startsWith(names(ST[[sn]]), ".")])
+}
+add("Daily_Equity", data.frame(Date = days, Strategy_Return = rp, Strategy_Equity = eq, BuyHold_Equity = eqb))
+XLSX <- file.path(OUT_DIR, "MeanReversion_Results_v3.xlsx"); openxlsx::saveWorkbook(wb, XLSX, overwrite = TRUE); cat("Saved:", file.path(basename(OUT_DIR), basename(XLSX)))
+```
+
+# 12. Visuals
+
+```{r viz-setup}
+NAVY <- "#1F3A5F"; ORANGE <- "#E07A2E"; GREY <- "#8A94A6"; LIGHT <- "#C9CED8"
+thp <- theme_minimal(base_size = 12) + theme(plot.title = element_text(face = "bold", size = 15, colour = NAVY),
+  plot.subtitle = element_text(colour = GREY), panel.grid.minor = element_blank(),
+  strip.text = element_text(face = "bold", colour = NAVY), legend.position = "top", legend.title = element_blank())
+save_plot <- function(p, name, w = 10, h = 5.5) { ggsave(file.path(OUT_DIR, name), p, width = w, height = h, dpi = 200, bg = "white",
+  device = if (HAS_RAGG) ragg::agg_png else "png"); p }
+yr <- format(days, "%Y"); calib$Date <- as.Date(paste0(calib$Month, "-01"))
+TWO_SERIES <- SMOOTHING != "none"                       # raw and used differ only when smoothing is on
+USED_LABEL <- if (TWO_SERIES) "Used" else "Calibrated"
+full_year <- names(which(table(yr) >= 200))             # calendar years with >= 200 trading days
+```
+
+```{r viz-usage, fig.height=7}
+top <- head(usage, 30)
+save_plot(ggplot(top, aes(reorder(Variable, Months_Selected), Months_Selected)) + geom_col(fill = NAVY, width = 0.7) + coord_flip() +
+  geom_text(aes(label = Months_Selected), hjust = -0.2, size = 3.3, colour = GREY) +
+  labs(title = "Most used variables", subtitle = "Months each variable was in the model (top 30)", x = NULL, y = "Months") + thp,
+  "01_variable_usage.png", h = 7)
+```
+
+```{r viz-returns}
+ann <- data.frame(Year = full_year, Strategy = as.numeric(tapply(1 + rp, yr, prod)[full_year] - 1),
+                  BuyHold = as.numeric(tapply(1 + bh, yr, prod)[full_year] - 1))
+al <- rbind(data.frame(Series = "Strategy", Return = ann$Strategy), data.frame(Series = "Buy & hold", Return = ann$BuyHold))
+brks <- seq(floor(min(al$Return) * 10) / 10, ceiling(max(al$Return) * 10) / 10 + 0.1, by = 0.1)
+save_plot(ggplot(al, aes(Return, fill = Series)) + geom_histogram(breaks = brks, position = "dodge", colour = "white") +
+  scale_fill_manual(values = c(Strategy = NAVY, `Buy & hold` = ORANGE)) + scale_x_continuous(labels = scales::percent) +
+  labs(title = "Distribution of annual returns", subtitle = "Full calendar years only; bins of 10 percentage points", x = "Annual return", y = "Years") + thp,
+  "02_annual_returns_hist.png")
+```
+
+```{r viz-sharpe}
+ann_sh <- tapply(rp, yr, function(r) if (isTRUE(sd(r) > 0)) mean(r) / sd(r) * sqrt(252) else NA)[full_year]   # full calendar years only
+save_plot(ggplot(data.frame(Sharpe = as.numeric(ann_sh[is.finite(ann_sh)])), aes(Sharpe)) + geom_histogram(bins = 12, fill = NAVY, colour = "white") +
+  geom_vline(xintercept = 0, colour = GREY) + labs(title = "Annual Sharpe ratio", subtitle = "Full calendar years only", x = "Sharpe", y = "Years") + thp,
+  "03a_annual_sharpe_hist.png")
+if (length(rp) > 252) {
+  cr <- cumsum(c(0, rp)); cr2 <- cumsum(c(0, rp^2)); s1 <- diff(cr, lag = 252); s2 <- diff(cr2, lag = 252)
+  sdv <- sqrt(pmax((s2 - s1^2 / 252) / 251, 0)); roll <- ifelse(sdv > 1e-12, (s1 / 252) / sdv * sqrt(252), NA)
+  save_plot(ggplot(data.frame(Sharpe = roll[is.finite(roll)]), aes(Sharpe)) + geom_histogram(bins = 40, fill = ORANGE, colour = "white") +
+    geom_vline(xintercept = 0, colour = GREY) + labs(title = "Rolling 12-month Sharpe ratio", x = "Sharpe", y = "Days") + thp,
+    "03b_rolling_sharpe_hist.png")
+}
+```
+
+```{r viz-equity}
+save_plot(ggplot(rbind(data.frame(Date = days, Equity = eq, Series = "Strategy"), data.frame(Date = days, Equity = eqb, Series = "Buy & hold")),
+  aes(Date, Equity, colour = Series)) + geom_line(linewidth = 0.8) + scale_y_log10() +
+  scale_colour_manual(values = c(Strategy = NAVY, `Buy & hold` = ORANGE)) +
+  labs(title = "Equity: model vs buy & hold", subtitle = "Growth of 1, log scale, net of costs", x = NULL, y = NULL) + thp, "04_equity_curves.png")
+```
+
+```{r viz-trade-returns}
+if (ntr) {
+  tc <- trades[trades$Exit_Reason != "Open", ]
+  save_plot(ggplot(tc, aes(Return, fill = Exit_Reason)) + geom_histogram(bins = 30, colour = "white") +
+    geom_vline(xintercept = 0, colour = GREY) + geom_vline(xintercept = mean(tc$Return), colour = NAVY, linetype = 2) +
+    scale_fill_manual(values = c(TP = "#2E7D32", SL = "#C62828", MaxHold = GREY, EndOfData = LIGHT)) +
+    scale_x_continuous(labels = scales::percent) +
+    labs(title = "Distribution of trade returns",
+         subtitle = sprintf("%d closed trades, net of costs; dashed line = average (%+.2f%%)", nrow(tc), 100 * mean(tc$Return)),
+         x = "Trade return", y = "Trades") + thp, "09_trade_return_hist.png")
+}
+```
+
+```{r viz-hit-rate}
+if (ntr) {
+  tc <- trades[trades$Exit_Reason != "Open", ]
+  roll20 <- vapply(seq_len(nrow(tc)), function(i) if (i < 20) NA_real_ else mean(tc$Hit[(i - 19):i]), 0)
+  hl <- rbind(data.frame(Date = tc$Entry_Day, Rate = tc$Cum_Hit_Rate, Series = "Cumulative hit rate"),
+              data.frame(Date = tc$Entry_Day, Rate = roll20, Series = "Rolling 20-trade hit rate"))
+  save_plot(ggplot(hl, aes(Date, Rate, colour = Series)) + geom_hline(yintercept = 0.5, colour = GREY, linetype = 2) +
+    geom_line(linewidth = 0.8) + scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+    scale_colour_manual(values = c("Cumulative hit rate" = NAVY, "Rolling 20-trade hit rate" = ORANGE)) +
+    labs(title = "Hit rate over time", subtitle = sprintf("Closed trades by entry date; final hit rate %.1f%% (dashed line = 50%%)",
+         100 * mean(tc$Hit)), x = NULL, y = NULL) + thp, "10_hit_rate_curve.png")
+}
+```
+
+```{r viz-trade-sharpe}
+if (ntr) {
+  tc <- trades[trades$Exit_Reason != "Open" & is.finite(trades$Trade_Sharpe), ]
+  n_out <- sum(trades$Exit_Reason != "Open") - nrow(tc)
+  if (nrow(tc)) save_plot(ggplot(tc, aes(Trade_Sharpe)) + geom_histogram(bins = 30, fill = NAVY, colour = "white") +
+    geom_vline(xintercept = 0, colour = GREY) + geom_vline(xintercept = median(tc$Trade_Sharpe), colour = ORANGE, linetype = 2) +
+    labs(title = "Distribution of trade Sharpe ratios",
+         subtitle = sprintf("Annualised Sharpe of each trade's daily returns while open\n%d trades (%d held < 5 days excluded); dashed line = median %.2f",
+                            nrow(tc), n_out, median(tc$Trade_Sharpe)), x = "Trade Sharpe", y = "Trades") + thp,
+    "11_trade_sharpe_hist.png")
+}
+```
+
+```{r viz-oos}
+oo <- data.frame(Date = calib$Date, R2 = calib$OOS_R2_used, Series = USED_LABEL)
+if (TWO_SERIES) oo <- rbind(data.frame(Date = calib$Date, R2 = calib$OOS_R2_raw, Series = "Calibrated (raw)"), oo)
+save_plot(ggplot(oo, aes(Date, R2, colour = Series)) +
+  geom_hline(yintercept = 0, colour = GREY) + geom_line(linewidth = 0.7) +
+  scale_colour_manual(values = setNames(c(LIGHT, NAVY), c("Calibrated (raw)", USED_LABEL))) +
+  labs(title = "Out-of-sample R² of the nowcast", subtitle = "Test window before each trade month", x = NULL, y = NULL) + thp, "05_oos_r2.png")
+```
+
+```{r viz-params, fig.height=8}
+pn <- c("Train_Win", "Test_Win", "Regr_Win", "Z_Win", "Train_MO", "Test_MO", "n", "Corr_t")
+pl <- do.call(rbind, lapply(pn, function(p) rbind(
+  data.frame(Date = calib$Date, Value = calib[[p]], Series = USED_LABEL, Parameter = p),
+  if (TWO_SERIES && paste0(p, "_raw") %in% names(calib)) data.frame(Date = calib$Date, Value = calib[[paste0(p, "_raw")]], Series = "Calibrated (raw)", Parameter = p))))
+pl$Parameter <- factor(pl$Parameter, pn)
+win_sub <- if (WINDOW_UPDATE == "monthly") paste0("Train_Win / Test_Win re-chosen every month (screen + joint calibration)",
+                                                    if (TWO_SERIES) "; smoothed pair used" else "") else
+  "Train_Win / Test_Win change only in January (annual recalibration)"
+save_plot(ggplot(pl, aes(Date, Value, colour = Series)) + geom_line(linewidth = 0.6) + facet_wrap(~Parameter, scales = "free_y", ncol = 3) +
+  scale_colour_manual(values = setNames(c(NAVY, LIGHT), c(USED_LABEL, "Calibrated (raw)"))) +
+  labs(title = "Parameters by month", subtitle = win_sub, x = NULL, y = NULL) + thp +
+  (if (!TWO_SERIES) theme(legend.position = "none")),
+  "06_parameters.png", h = 8)
+```
+
+```{r viz-coefs, fig.height=8}
+cn <- c(WEIGHTS, "t", "s", "Min_Res")
+cl <- do.call(rbind, lapply(cn, function(p) rbind(
+  data.frame(Date = calib$Date, Value = calib[[p]], Series = USED_LABEL, Coefficient = p),
+  if (TWO_SERIES) data.frame(Date = calib$Date, Value = calib[[paste0(p, "_raw")]], Series = "Calibrated (raw)", Coefficient = p))))
+cl$Coefficient <- factor(cl$Coefficient, cn)
+save_plot(ggplot(cl, aes(Date, Value, colour = Series)) + geom_hline(yintercept = 0, colour = GREY, linewidth = 0.3) + geom_line(linewidth = 0.6) +
+  facet_wrap(~Coefficient, scales = "free_y", ncol = 3) + scale_colour_manual(values = setNames(c(ORANGE, LIGHT), c(USED_LABEL, "Calibrated (raw)"))) +
+  labs(title = "Coefficients by month", subtitle = paste0(paste(WEIGHTS, collapse = ", "), ": score weights; t, s: TP / SL multipliers (fixed at 1); Min_Res: x residual SD"), x = NULL, y = NULL) + thp +
+  (if (!TWO_SERIES) theme(legend.position = "none")),
+  "07_coefficients.png", h = 8)
+```
+
+```{r viz-forward, eval = exists("fwd") && !identical(get0("SMOOTHING"), "none")}
+fwd$Date <- as.Date(paste0(fwd$Month, "-01"))
+roll12 <- function(x) vapply(seq_along(x), function(i) { v <- x[max(1, i - 11):i]; if (sum(is.finite(v)) < 6) NA else mean(v, na.rm = TRUE) }, 0)
+fl <- rbind(data.frame(Date = fwd$Date, R2 = roll12(fwd$Forward_R2_raw), Series = "Raw calibration"),
+            data.frame(Date = fwd$Date, R2 = roll12(fwd$Forward_R2_used), Series = "Smoothed (used)"))
+save_plot(ggplot(fl, aes(Date, R2, colour = Series)) + geom_hline(yintercept = 0, colour = GREY) + geom_line(linewidth = 0.8) +
+  scale_colour_manual(values = c("Raw calibration" = GREY, "Smoothed (used)" = NAVY)) +
+  labs(title = "Forward out-of-sample R²: raw vs smoothed parameters",
+       subtitle = "Parameters chosen at each month, tested on the following months (12-month average). Evaluation only.", x = NULL, y = NULL) + thp,
+  "08_forward_oos_r2.png")
+```
+
+```{r viz-strategies, eval = isTRUE(get0("VALIDATION_MODE")) && exists("SRP")}
+sl <- do.call(rbind, c(lapply(names(S_LAB), function(sn) data.frame(Date = s_days, Equity = cumprod(1 + SRP[[sn]]), Series = S_LAB[[sn]])),
+                       list(data.frame(Date = s_days, Equity = cumprod(1 + D$r[f0:D$n_days]), Series = "Buy & hold"))))
+sl$Series <- factor(sl$Series, c(S_LAB, "Buy & hold"))
+save_plot(ggplot(sl, aes(Date, Equity, colour = Series)) + geom_line(linewidth = 0.7) + scale_y_log10() +
+  scale_colour_manual(values = setNames(c(GREY, NAVY, ORANGE, "#2E7D32", "#8E44AD", LIGHT), c(S_LAB, "Buy & hold"))) +
+  labs(title = "Validation strategies vs buy & hold", subtitle = "Growth of 1, log scale, net of costs, same dates", x = NULL, y = NULL) + thp,
+  "12_validation_strategies.png")
+```
+
+```{r viz-hetero, fig.height=7, eval = isTRUE(get0("HETERO_DIAG"))}
+hd <- calib[is.finite(calib$BP_p), ]
+if (nrow(hd)) {
+  hl <- rbind(data.frame(Date = hd$Date, Value = -log10(pmax(hd$BP_p, 1e-12)), Panel = "Breusch-Pagan: -log10(p)  (above dashed line = heteroskedastic at 5%)"),
+              data.frame(Date = hd$Date, Value = log2(hd$Var_Ratio), Panel = "Variance ratio, log2 scale: 0 = unchanged, +1 = test errors doubled, -1 = halved"))
+  refs <- data.frame(Panel = unique(hl$Panel), y = c(-log10(0.05), 0))
+  save_plot(ggplot(hl, aes(Date, Value)) + geom_hline(data = refs, aes(yintercept = y), linetype = 2, colour = GREY) +
+    geom_line(colour = NAVY, linewidth = 0.6) + facet_wrap(~Panel, ncol = 1, scales = "free_y") +
+    labs(title = "Heteroskedasticity of the nowcast regression", subtitle = sprintf("%.0f%% of months heteroskedastic at 5%%; median variance ratio %.2f",
+         100 * mean(hd$BP_p < 0.05), median(hd$Var_Ratio, na.rm = TRUE)), x = NULL, y = NULL) + thp, "13_heteroskedasticity.png", h = 7)
+}
+```
+
+```{r viz-hetero-trades, eval = isTRUE(get0("HETERO_DIAG")) && exists("trades") && "Var_Ratio" %in% names(trades)}
+tv <- trades[trades$Exit_Reason != "Open" & is.finite(trades$Var_Ratio), ]
+if (nrow(tv) >= 9) {
+  tv$Bucket <- cut(tv$Var_Ratio, unique(quantile(tv$Var_Ratio, c(0, 1/3, 2/3, 1))), include.lowest = TRUE,
+                   labels = c("Low ratio", "Middle", "High ratio")[seq_len(length(unique(quantile(tv$Var_Ratio, c(0, 1/3, 2/3, 1)))) - 1)])
+  sm <- aggregate(Return ~ Bucket, tv, function(r) c(mean = mean(r), n = length(r), hit = mean(r > 0)))
+  sm <- data.frame(Bucket = sm$Bucket, Avg = sm$Return[, "mean"], N = sm$Return[, "n"], Hit = sm$Return[, "hit"])
+  save_plot(ggplot(sm, aes(Bucket, Avg, fill = Avg > 0)) + geom_col(width = 0.6) + geom_hline(yintercept = 0, colour = GREY) +
+    geom_text(aes(label = sprintf("%+.2f%%\n%d trades, hit %.0f%%", 100 * Avg, N, 100 * Hit), vjust = ifelse(Avg > 0, -0.3, 1.2)), size = 3.4) +
+    scale_fill_manual(values = c(`TRUE` = "#2E7D32", `FALSE` = "#C62828"), guide = "none") + scale_y_continuous(labels = scales::percent, expand = expansion(mult = 0.25)) +
+    labs(title = "Trade results by variance ratio at decision", subtitle = "Terciles of test / training residual variance: a candidate input for the Markov states",
+         x = NULL, y = "Average trade return") + thp, "14_trades_by_variance_ratio.png")
+}
+```
+
+```{r viz-linearity, fig.height=7, eval = exists("lin")}
+ln <- head(lin[lin$Months_nonlinear > 0, ], 20)
+if (nrow(ln)) save_plot(ggplot(ln, aes(reorder(Variable, Months_nonlinear), Months_nonlinear, fill = Most_common_form_when_nonlinear)) +
+  geom_col(width = 0.7) + geom_text(aes(label = sprintf("%d of %d months", Months_nonlinear, Months_selected)), hjust = -0.1, size = 3) +
+  coord_flip() + scale_y_continuous(expand = expansion(mult = c(0, 0.3))) +
+  scale_fill_manual(values = c(`Signed log` = NAVY, `Signed sqrt` = ORANGE, Linear = GREY), labels = c(Linear = "x^2 test only"), name = "Better form") +
+  labs(title = "Variables most often non-linear while in the model", subtitle = sprintf("Rolling check on each month's training window (top %d of %d variables ever flagged)",
+       nrow(ln), sum(lin$Months_nonlinear > 0)), x = NULL, y = "Months flagged non-linear") + thp, "15_nonlinear_variables.png", h = 7)
+```
+
+```{r viz-linearity-time, fig.height=7, eval = exists("mon_lin")}
+ml <- mon_lin; ml$Date <- as.Date(paste0(ml$Month, "-01"))
+roll12 <- function(x) vapply(seq_along(x), function(i) { v <- x[max(1, i - 11):i]; if (sum(is.finite(v)) < 6) NA else mean(v, na.rm = TRUE) }, 0)
+lt <- rbind(data.frame(Date = ml$Date, Value = pmax(-log10(ml$Model_RESET_p), 0), Panel = "1. Whole-model RESET test: -log10(p)  (above the line = misspecified)"),
+            data.frame(Date = ml$Date, Value = ml$Share, Panel = "2. Share of the selected variables flagged non-linear"))
+lt$Smooth <- ave(lt$Value, lt$Panel, FUN = roll12)
+save_plot(ggplot(lt, aes(Date, Value)) + geom_col(fill = GREY, alpha = 0.6, width = 25) + geom_line(aes(y = Smooth), colour = NAVY, linewidth = 0.9) +
+  geom_hline(data = data.frame(Panel = unique(lt$Panel)[1], y = -log10(LIN_P)), aes(yintercept = y), colour = ORANGE, linetype = 2) +
+  facet_wrap(~Panel, ncol = 1, scales = "free_y") +
+  labs(title = "Linearity of the model over time", subtitle = sprintf("Model used each month, on its own training window; line = 12-month average. RESET fails in %.0f%% of months",
+       100 * mean(ml$Model_RESET_p < LIN_P, na.rm = TRUE)), x = NULL, y = NULL) + thp, "16_linearity_over_time.png", h = 7)
+```
+
+```{r viz-linearity-trades, eval = exists("trades") && "Lin_RESET_p" %in% names(trades)}
+tl <- trades[trades$Exit_Reason != "Open" & is.finite(trades$Lin_RESET_p), ]
+if (nrow(tl) >= 10) {
+  tl$Bucket <- factor(ifelse(tl$Lin_RESET_p < LIN_P, "Model misspecified (RESET p < LIN_P)", "Model passes RESET"),
+                      levels = c("Model passes RESET", "Model misspecified (RESET p < LIN_P)"))
+  sl <- aggregate(Return ~ Bucket, tl, function(r) c(mean = mean(r), n = length(r), hit = mean(r > 0)))
+  sl <- data.frame(Bucket = sl$Bucket, Avg = sl$Return[, "mean"], N = sl$Return[, "n"], Hit = sl$Return[, "hit"])
+  save_plot(ggplot(sl, aes(Bucket, Avg, fill = Avg > 0)) + geom_col(width = 0.5) + geom_hline(yintercept = 0, colour = GREY) +
+    geom_text(aes(label = sprintf("%+.2f%%\n%d trades, hit %.0f%%", 100 * Avg, N, 100 * Hit), vjust = ifelse(Avg > 0, -0.3, 1.2)), size = 3.4) +
+    scale_fill_manual(values = c(`TRUE` = "#2E7D32", `FALSE` = "#C62828"), guide = "none") + scale_y_continuous(labels = scales::percent, expand = expansion(mult = 0.25)) +
+    labs(title = "Trade results by linearity of the model at decision", subtitle = "A candidate input for the Markov states / break classification",
+         x = NULL, y = "Average trade return") + thp, "21_trades_by_linearity.png")
+}
+```
+
+```{r viz-markov3, fig.height=9, eval = exists("mks") && isTRUE(get0("MK_METHOD") %in% c("hmm3", "hmm3b"))}
+LO <- LBL3[1]; HI <- LBL3[3]
+rr <- with(rle(ifelse(is.na(mks$MK_Regime), "none", mks$MK_Regime)), { e <- cumsum(lengths); data.frame(r = values, s = e - lengths + 1, e = e) })
+rr <- rr[rr$r %in% c(LO, HI), ]
+bands <- if (nrow(rr)) data.frame(xmin = mks$Date[rr$s], xmax = mks$Date[rr$e] + 31, Regime = rr$r) else data.frame(xmin = as.Date(character()), xmax = as.Date(character()), Regime = character())
+m3 <- rbind(data.frame(Date = mks$Date, Value = mks$MK_Input_log2VR, Panel = "1. Variance ratio (log2)"),
+            if (MK_METHOD == "hmm3") data.frame(Date = mks$Date, Value = exp(mks$MK_Input_logVol), Panel = "2. VLO realised volatility (annualised)")
+            else data.frame(Date = mks$Date, Value = mks$MK_Input_RetDev, Panel = if (identical(MK_INPUT1, "reversion"))
+              sprintf("2. Reversion efficacy: corr(residual, next-month return), last %d signals (negative = reverting)", MK_DEV_MONTHS)
+              else sprintf("2. VLO return deviation vs past %d months (z)", MK_DEV_MONTHS)),
+            data.frame(Date = mks$Date, Value = mks$MK_Input_R2_Slope, Panel = sprintf("3. Slope of validation OOS R2 over %d months (per month)",
+                       if (MK_METHOD == "hmm3b") MK_B_SLOPE_MONTHS else MK_SLOPE_MONTHS)),
+            if (MK_METHOD == "hmm3b" && "MK_Action" %in% names(mks))
+              data.frame(Date = mks$Date, Value = mks$MK_Action, Panel = sprintf("4. Graded action: 1 = trade, 0 = skip, -1 = flip (>= %s of %d fits low%s)",
+                         MK_FLIP_VOTES, length(MK_ENS_WINDOWS), if (MK_USE_CALM) " + calm" else ""))
+            else data.frame(Date = mks$Date, Value = mks$MK_State, Panel = "4. State used: 1 = trade, 0 = worst regime (skip / flip)"))
+m3$Panel <- factor(m3$Panel, unique(m3$Panel))
+save_plot(ggplot(m3, aes(Date, Value)) +
+  geom_rect(data = bands, aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = Regime), inherit.aes = FALSE, alpha = 0.15) +
+  scale_fill_manual(values = setNames(c("#4A90C2", "#E07A2E"), c(LO, HI)), name = NULL) +
+  geom_line(colour = NAVY, linewidth = 0.6, na.rm = TRUE) + facet_wrap(~Panel, ncol = 1, scales = "free_y") +
+  labs(title = "Markov regimes (3 states)", subtitle = sprintf("Blue = %s, orange = %s, unshaded = %s%s; state 0 (%s) in %d months",
+       LBL3[1], LBL3[3], LBL3[2], if (MK_METHOD == "hmm3b") " variance ratio" else "", tail(mks$MK_Worst_Regime, 1) %||% "-",
+       sum(mks$MK_State == 0)), x = NULL, y = NULL) + thp, "17_markov_states.png", h = 9)
+```
+
+```{r viz-markov, fig.height=8, eval = exists("mks") && !isTRUE(get0("MK_METHOD") %in% c("hmm3", "hmm3b"))}
+mk_runs <- with(rle(mks$MK_State == 0), { end <- cumsum(lengths); start <- end - lengths + 1; data.frame(s = start[values], e = end[values]) })
+shade <- if (nrow(mk_runs)) data.frame(xmin = mks$Date[mk_runs$s], xmax = mks$Date[mk_runs$e] + 31) else data.frame(xmin = as.Date(NA), xmax = as.Date(NA))[0, ]
+ml <- rbind(data.frame(Date = mks$Date, Value = mks$MK_Input_log2VR, Panel = "1. Variance ratio (log2; 0 = unchanged)"),
+            data.frame(Date = mks$Date, Value = mks$MK_Input_OOS_R2, Panel = "2. OOS R2 of the model behind the trade (capped at -1)"),
+            data.frame(Date = mks$Date, Value = mks$MK_Score, Panel = "3. Combined score: z(variance ratio) + z(OOS R2)"),
+            if (MK_METHOD == "hmm") data.frame(Date = mks$Date, Value = mks$MK_P_bad, Panel = "4. Filtered P(bad state)  (dashed: enter 0 / leave 0)"))
+mref <- if (MK_METHOD == "hmm") data.frame(Panel = rep(unique(ml$Panel), c(1, 1, 1, 2)), y = c(0, 0, 0, MK_ENTER, MK_EXIT)) else
+  rbind(data.frame(Panel = unique(ml$Panel)[1:2], y = 0), data.frame(Panel = unique(ml$Panel)[3], y = NA_real_))
+ml$Panel <- factor(ml$Panel, unique(ml$Panel))
+save_plot(ggplot(ml, aes(Date, Value)) +
+  geom_rect(data = shade, aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf), inherit.aes = FALSE, fill = "#C62828", alpha = 0.12) +
+  geom_hline(data = mref[is.finite(mref$y), ], aes(yintercept = y), linetype = 2, colour = GREY) + geom_line(colour = NAVY, linewidth = 0.6, na.rm = TRUE) +
+  (if (MK_METHOD == "threshold") geom_line(data = data.frame(Date = mks$Date, Value = mks$MK_Threshold,
+     Panel = factor("3. Combined score: z(variance ratio) + z(OOS R2)", levels(ml$Panel))), colour = ORANGE, linetype = 2, linewidth = 0.6, na.rm = TRUE)) +
+  facet_wrap(~Panel, ncol = 1, scales = "free_y") +
+  labs(title = "Markov states", subtitle = sprintf("Red bands = state 0 (bad): %.0f%% of months, %d switches%s", 100 * mean(mks$MK_State == 0), sum(diff(mks$MK_State) != 0),
+       if (MK_METHOD == "threshold") sprintf("; orange dashed = threshold (%.2f quantile of the score so far)", MK_QUANTILE) else ""),
+       x = NULL, y = NULL) + thp, "17_markov_states.png", h = 9)
+```
+
+```{r viz-markov-equity, eval = exists("MKR")}
+me <- do.call(rbind, lapply(names(MK_LAB), function(k) data.frame(Date = mk_days, Equity = cumprod(1 + MKR[[k]]), Series = MK_LAB[[k]])))
+me$Series <- factor(me$Series, MK_LAB)
+save_plot(ggplot(me, aes(Date, Equity, colour = Series)) + geom_line(linewidth = 0.8) +
+  scale_colour_manual(values = setNames(c(GREY, NAVY, ORANGE), MK_LAB)) +
+  labs(title = "Baseline vs Markov skip vs Markov flip", subtitle = "Same signals; growth of 1, net of costs", x = NULL, y = NULL) + thp,
+  "18_markov_equity.png")
+```
+
+```{r viz-combined, eval = exists("CR")}
+keys <- unique(c("base none", "base flip", "base skip", ck))
+cl2 <- do.call(rbind, lapply(keys, function(k) { p2 <- strsplit(k, " ")[[1]]
+  data.frame(Date = c_days, Equity = cumprod(1 + CR[[k]]), Series = sprintf("%s + %s%s", SL5[[p2[1]]], RULES[[p2[2]]], if (k == ck) " (combined)" else "")) }))
+cl2 <- rbind(cl2, data.frame(Date = c_days, Equity = cumprod(1 + D$r[cf0:D$n_days]) / 1, Series = paste(STOCK, "buy & hold")))
+cl2$Series <- factor(cl2$Series, unique(cl2$Series))
+save_plot(ggplot(cl2, aes(Date, Equity, colour = Series)) + geom_line(linewidth = 0.8) + scale_y_log10() +
+  scale_colour_manual(values = setNames(c(GREY, ORANGE, "#4A90C2", "#2E7D32", LIGHT)[seq_along(levels(cl2$Series))], levels(cl2$Series))) +
+  labs(title = "Combined model vs baseline", subtitle = "Validation strategy x Markov rule; growth of 1, log scale, net of costs", x = NULL, y = NULL) + thp,
+  "19_combined_model.png")
+```
+
+```{r viz-base-flip, fig.height=7, eval = exists("CR") && "base flip" %in% names(CR)}
+bf <- rbind(data.frame(Date = c_days, r = CR[["base none"]], Series = "Baseline"),
+            data.frame(Date = c_days, r = CR[["base flip"]], Series = "Baseline + Markov flip"))
+bf <- do.call(rbind, lapply(split(bf, bf$Series), function(x) { e <- cumprod(1 + x$r)
+  rbind(data.frame(Date = x$Date, Value = e, Series = x$Series[1], Panel = "Equity (growth of 1, net of costs)"),
+        data.frame(Date = x$Date, Value = e / cummax(e) - 1, Series = x$Series[1], Panel = "Drawdown")) }))
+bf$Panel <- factor(bf$Panel, c("Equity (growth of 1, net of costs)", "Drawdown"))
+st_bf <- c_stats("base flip"); st_b0 <- c_stats("base none")
+save_plot(ggplot(bf, aes(Date, Value, colour = Series)) + geom_hline(data = data.frame(Panel = factor("Drawdown", levels(bf$Panel)), y = 0),
+    aes(yintercept = y), colour = GREY, linewidth = 0.3) + geom_line(linewidth = 0.8) + facet_wrap(~Panel, ncol = 1, scales = "free_y") +
+  scale_colour_manual(values = c(Baseline = GREY, `Baseline + Markov flip` = NAVY)) +
+  labs(title = "Baseline + Markov flip", subtitle = sprintf("Flip: CAGR %s, Sharpe %s, max DD %s  |  Baseline: CAGR %s, Sharpe %s, max DD %s",
+       st_bf$CAGR, st_bf$Sharpe, st_bf$`Max drawdown`, st_b0$CAGR, st_b0$Sharpe, st_b0$`Max drawdown`), x = NULL, y = NULL) + thp,
+  "20_base_markov_flip.png", h = 7)
+```
+
+# 13. All stocks
+
+With `RUN_ALL = TRUE` every stock in `RUN_ALL_STOCKS` is run with exactly the settings above (nothing re-tuned per stock), each in its own R session and output folder (`MeanReversion_Results_v3_<STOCK>_<RUN_TAG>`, with its own report and Excel file). This section then compares them. Each stock trades only after its own warm-up, so the stocks listed later have shorter trading periods: compare Sharpe ratios together with the trading period and the number of trades, and use the common-period columns for a like-for-like comparison.
+
+```{r all-run, eval = isTRUE(RUN_ALL)}
+t_all <- Sys.time()
+rmd_in <- knitr::current_input(dir = TRUE)
+if (is.null(rmd_in) && requireNamespace("rstudioapi", quietly = TRUE)) rmd_in <- tryCatch(rstudioapi::getSourceEditorContext()$path, error = function(e) NULL)
+if (is.null(rmd_in) || !file.exists(rmd_in)) stop("RUN_ALL needs the file to be knitted (Knit button or rmarkdown::render), not run chunk by chunk.")
+bad <- setdiff(RUN_ALL_STOCKS, names(PEER_COLS)); if (length(bad)) stop("Not in PEER_COLS: ", paste(bad, collapse = ", "))
+peers <- setdiff(RUN_ALL_STOCKS, STOCK)
+rscript <- file.path(R.home("bin"), "Rscript")
+run_peer <- function(tk) {
+  od <- out_dir_for(tk); dir.create(od, showWarnings = FALSE, recursive = TRUE)
+  tmp <- file.path(tempdir(), paste0("mr_", tk)); unlink(tmp, recursive = TRUE); dir.create(tmp, recursive = TRUE)
+  runner <- file.path(tmp, "run.R")
+  writeLines(c(sprintf("Sys.setenv(MR_CHILD_STOCK = %s)", deparse(tk)),
+               sprintf("rmarkdown::render(%s, output_file = %s, output_dir = %s, intermediates_dir = %s, knit_root_dir = %s, envir = new.env(), quiet = TRUE)",
+                       deparse(rmd_in), deparse(paste0("Mean_Reversion_", tk, ".html")), deparse(od), deparse(tmp), deparse(tmp))), runner)
+  log_file <- file.path(od, "render_log.txt"); t0 <- Sys.time()
+  cat(format(Sys.time(), "%H:%M:%S"), " ", tk, " started\n", file = LOG_FILE, append = TRUE, sep = "")
+  st <- system2(rscript, shQuote(runner), stdout = log_file, stderr = log_file)
+  mins <- as.numeric(difftime(Sys.time(), t0, units = "mins"))
+  cat(format(Sys.time(), "%H:%M:%S"), " ", tk, if (identical(st, 0L)) " finished" else " FAILED (see render_log.txt)",
+      sprintf(" after %.0f min\n", mins), file = LOG_FILE, append = TRUE, sep = "")
+  why <- if (identical(st, 0L)) "" else { lg <- tryCatch(readLines(log_file, warn = FALSE), error = function(e) "render_log.txt not readable")
+    lg <- trimws(lg[nzchar(trimws(lg)) & !grepl("^[0-9]{2}:[0-9]{2}:[0-9]{2}", lg)])               # drop progress lines
+    i <- grep("error|Error|Quitting|not found|cannot|halted", lg); paste(tail(lg[sort(unique(c(i, i + 1)))[sort(unique(c(i, i + 1))) <= length(lg)]], 4), collapse = " | ") }
+  data.frame(Stock = tk, Status = if (identical(st, 0L)) "finished" else paste("FAILED:", why),
+             Minutes = round(mins), Folder = file.path("results", basename(od)))
+}
+run_status <- do.call(rbind, parallel::mclapply(peers, run_peer, mc.cores = max(1L, as.integer(RUN_ALL_PARALLEL)), mc.preschedule = FALSE))
+run_status
+```
+
+```{r all-collect, eval = isTRUE(RUN_ALL)}
+ALL <- c(STOCK, peers)
+CMP <- list()
+for (tk in ALL) {
+  f <- file.path(out_dir_for(tk), "compare.rds")
+  if (file.exists(f) && (tk == STOCK || file.mtime(f) >= t_all)) CMP[[tk]] <- readRDS(f)   # peers: only results written by this render
+}
+missing_tk <- setdiff(ALL, names(CMP))
+if (length(missing_tk)) cat("No results for:", paste(missing_tk, collapse = ", "), "- they are left out of the comparison.\n")
+pst <- function(r) { r <- r[is.finite(r)]; if (length(r) < 2) return(c(CAGR = NA, Sharpe = NA, MaxDD = NA)); e <- cumprod(1 + r)
+  c(CAGR = e[length(e)]^(252 / length(r)) - 1, Sharpe = if (sd(r) > 0) mean(r) / sd(r) * sqrt(252) else NA, MaxDD = min(e / cummax(e) - 1)) }
+closed <- function(x) if (is.null(x) || !nrow(x)) NULL else x[x$Exit_Reason != "Open", ]
+first_trade <- function(x) { cl <- closed(x); if (is.null(cl)) NA else as.Date(min(cl$Entry_Day)) }
+# common period: from the latest first trade among the stocks to the common last day
+starts <- as.Date(vapply(CMP, function(x) as.numeric(first_trade(x$trades) %||% x$days[1]), 0), origin = "1970-01-01")
+starts[is.na(starts)] <- as.Date(vapply(CMP[is.na(starts)], function(x) as.numeric(x$days[1]), 0), origin = "1970-01-01")
+names(starts) <- names(CMP)
+yrs_trading <- vapply(names(CMP), function(tk) sum(CMP[[tk]]$days >= starts[[tk]]) / 252, 0)
+COMMON_MIN_YEARS <- 3                                          # stocks trading for less than this do not set the common start
+COMMON_FROM <- max(starts[yrs_trading >= COMMON_MIN_YEARS | names(CMP) == STOCK]); COMMON_TO <- min(as.Date(vapply(CMP, function(x) as.numeric(max(x$days)), 0), origin = "1970-01-01"))
+in_common <- function(x, r) if (x$stock %in% names(CMP)[yrs_trading < COMMON_MIN_YEARS & names(CMP) != STOCK]) NA_real_ else
+  r[x$days >= COMMON_FROM & x$days <= COMMON_TO]
+fp <- function(v, d = 1) ifelse(is.finite(v), sprintf(paste0("%.", d, "f%%"), 100 * v), "-")
+ALL_SUM <- do.call(rbind, lapply(names(CMP), function(tk) { x <- CMP[[tk]]; cl <- closed(x$trades)
+  ft <- first_trade(x$trades); keep <- if (is.na(ft)) rep(TRUE, length(x$days)) else x$days >= ft
+  sc <- pst(x$comb[keep]); sb <- pst(x$base[keep]); sh <- pst(x$bh[keep])
+  cc <- pst(in_common(x, x$comb)); ch <- pst(in_common(x, x$bh))
+  data.frame(Stock = tk, `Data from` = format(x$data_from, "%Y-%m"), `Trading from` = if (is.na(ft)) "-" else format(ft, "%Y-%m"),
+             Years = round(sum(keep) / 252, 1), Trades = if (is.null(cl)) 0 else nrow(cl),
+             `Hit rate` = if (is.null(cl)) "-" else fp(mean(cl$Hit), 0),
+             `Sharpe baseline` = round(sb[["Sharpe"]], 2), `Sharpe combined` = round(sc[["Sharpe"]], 2),
+             `CAGR combined` = fp(sc[["CAGR"]], 2), `Max DD combined` = fp(sc[["MaxDD"]]),
+             `Sharpe buy & hold` = round(sh[["Sharpe"]], 2), `Max DD buy & hold` = fp(sh[["MaxDD"]]),
+             `Sharpe combined (common)` = round(cc[["Sharpe"]], 2), `Sharpe buy & hold (common)` = round(ch[["Sharpe"]], 2),
+             check.names = FALSE) }))
+cat(sprintf("Combined model = %s. Common period: %s to %s (stocks trading under %d years are left out of it). Sharpe, CAGR and drawdowns from each stock's first trade (net of costs).\n",
+            CMP[[1]]$comb_label, format(COMMON_FROM, "%Y-%m"), format(COMMON_TO, "%Y-%m"), COMMON_MIN_YEARS))
+ALL_SUM
+```
+
+```{r all-viz, fig.height=6, eval = isTRUE(RUN_ALL) && length(CMP) > 1}
+PAL <- c(NAVY, ORANGE, "#4A90C2", "#2E7D32", "#8E44AD", "#B03A2E", "#C9A227", GREY)
+SCOL <- setNames(PAL[seq_along(CMP)], names(CMP))
+if ("SUN" %in% names(SCOL)) SCOL[["SUN"]] <- GREY                               # the non-refiner control in grey
+ord <- names(CMP)
+# (a) Sharpe by stock: baseline, combined, buy & hold (from each stock's first trade)
+sh <- do.call(rbind, lapply(seq_len(nrow(ALL_SUM)), function(i) data.frame(Stock = ALL_SUM$Stock[i],
+  Series = c("Baseline", "Combined model", "Buy & hold"),
+  Sharpe = c(ALL_SUM$`Sharpe baseline`[i], ALL_SUM$`Sharpe combined`[i], ALL_SUM$`Sharpe buy & hold`[i]))))
+sh$Stock <- factor(sh$Stock, ord); sh$Series <- factor(sh$Series, c("Baseline", "Combined model", "Buy & hold"))
+save_plot(ggplot(sh, aes(Stock, Sharpe, fill = Series)) + geom_col(position = position_dodge(0.8), width = 0.75) +
+  geom_hline(yintercept = 0, colour = GREY, linewidth = 0.3) +
+  geom_text(aes(label = sprintf("%.2f", Sharpe), vjust = ifelse(Sharpe >= 0, -0.4, 1.3)), position = position_dodge(0.8), size = 3.2, colour = NAVY) +
+  scale_fill_manual(values = c(Baseline = LIGHT, `Combined model` = NAVY, `Buy & hold` = ORANGE)) +
+  labs(title = "Sharpe ratio by stock", subtitle = sprintf("Same settings for every stock; combined = %s; from each stock's first trade, net of costs",
+       CMP[[1]]$comb_label), x = NULL, y = NULL) + thp, "30_all_sharpe.png")
+```
+
+```{r all-viz-equity, fig.height=6, eval = isTRUE(RUN_ALL) && length(CMP) > 1}
+# (b) combined model equity, every stock from its own first trade
+eqd <- do.call(rbind, lapply(ord, function(tk) { x <- CMP[[tk]]; ft <- first_trade(x$trades)
+  keep <- if (is.na(ft)) rep(TRUE, length(x$days)) else x$days >= ft
+  data.frame(Date = x$days[keep], Equity = cumprod(1 + x$comb[keep]), Stock = tk) }))
+eqd$Stock <- factor(eqd$Stock, ord)
+save_plot(ggplot(eqd, aes(Date, Equity, colour = Stock)) + geom_hline(yintercept = 1, colour = LIGHT, linewidth = 0.3) +
+  geom_line(aes(linewidth = Stock == STOCK)) + scale_linewidth_manual(values = c(`TRUE` = 1.1, `FALSE` = 0.7), guide = "none") +
+  scale_colour_manual(values = SCOL) + scale_y_log10() +
+  labs(title = "Combined model, all stocks", subtitle = "Growth of 1 from each stock's first trade; log scale, net of costs", x = NULL, y = NULL) + thp,
+  "31_all_equity.png")
+```
+
+```{r all-viz-common, fig.height=6, eval = isTRUE(RUN_ALL) && length(CMP) > 1}
+# (c) common period: all stocks from the same start date
+cmd <- do.call(rbind, lapply(ord[yrs_trading[ord] >= COMMON_MIN_YEARS | ord == STOCK], function(tk) { x <- CMP[[tk]]; k <- x$days >= COMMON_FROM & x$days <= COMMON_TO
+  data.frame(Date = x$days[k], Equity = cumprod(1 + x$comb[k]), Stock = tk) }))
+cmd$Stock <- factor(cmd$Stock, ord)
+save_plot(ggplot(cmd, aes(Date, Equity, colour = Stock)) + geom_hline(yintercept = 1, colour = LIGHT, linewidth = 0.3) +
+  geom_line(linewidth = 0.8) + scale_colour_manual(values = SCOL) +
+  labs(title = "Combined model over the common period", subtitle = sprintf("All stocks from %s (latest first trade); growth of 1, net of costs",
+       format(COMMON_FROM, "%b %Y")), x = NULL, y = NULL) + thp, "32_all_equity_common.png")
+```
+
+```{r all-viz-panels, fig.height=11, eval = isTRUE(RUN_ALL) && length(CMP) > 1}
+# (d) one panel per stock: combined vs baseline vs buy & hold
+pan <- do.call(rbind, lapply(ord, function(tk) { x <- CMP[[tk]]; ft <- first_trade(x$trades)
+  keep <- if (is.na(ft)) rep(TRUE, length(x$days)) else x$days >= ft
+  rbind(data.frame(Date = x$days[keep], Equity = cumprod(1 + x$comb[keep]), Series = "Combined model", Stock = tk),
+        data.frame(Date = x$days[keep], Equity = cumprod(1 + x$base[keep]), Series = "Baseline", Stock = tk),
+        data.frame(Date = x$days[keep], Equity = cumprod(1 + x$bh[keep]), Series = "Buy & hold", Stock = tk)) }))
+pan$Stock <- factor(pan$Stock, ord); pan$Series <- factor(pan$Series, c("Combined model", "Baseline", "Buy & hold"))
+save_plot(ggplot(pan, aes(Date, Equity, colour = Series)) + geom_hline(yintercept = 1, colour = LIGHT, linewidth = 0.3) + geom_line(linewidth = 0.6) +
+  facet_wrap(~Stock, scales = "free", ncol = 2) + scale_y_log10() +
+  scale_colour_manual(values = c(`Combined model` = NAVY, Baseline = GREY, `Buy & hold` = ORANGE)) +
+  labs(title = "Each stock: combined model vs baseline vs buy & hold", subtitle = "Growth of 1 from the stock's first trade; log scale, net of costs",
+       x = NULL, y = NULL) + thp, "33_all_panels.png", h = 1.5 + 2.4 * ceiling(length(ord) / 2))
+```
+
+```{r all-viz-years, fig.height=5, eval = isTRUE(RUN_ALL) && length(CMP) > 1}
+# (e) calendar-year returns of the combined model
+yrs <- do.call(rbind, lapply(ord, function(tk) { x <- CMP[[tk]]; ft <- first_trade(x$trades)
+  keep <- if (is.na(ft)) rep(TRUE, length(x$days)) else x$days >= ft
+  y <- tapply(x$comb[keep], format(x$days[keep], "%Y"), function(r) prod(1 + r) - 1)
+  data.frame(Stock = tk, Year = names(y), Return = as.numeric(y)) }))
+yrs$Stock <- factor(yrs$Stock, rev(ord))
+lim <- max(abs(yrs$Return), na.rm = TRUE)
+save_plot(ggplot(yrs, aes(Year, Stock, fill = Return)) + geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.0f%%", 100 * Return)), size = 3, colour = ifelse(abs(yrs$Return) > 0.6 * lim, "white", NAVY)) +
+  scale_fill_gradient2(low = "#B03A2E", mid = "#F4F4F4", high = NAVY, midpoint = 0, limits = c(-lim, lim), labels = scales::percent) +
+  labs(title = "Combined model: return by calendar year", subtitle = "Net of costs; first year partial (from the first trade)", x = NULL, y = NULL) +
+  thp + theme(legend.position = "right", panel.grid = element_blank()), "34_all_years.png", h = 5)
+```
+
+```{r all-excel, eval = isTRUE(RUN_ALL) && length(CMP) > 0}
+wb2 <- openxlsx::createWorkbook()
+openxlsx::addWorksheet(wb2, "Summary"); openxlsx::writeData(wb2, "Summary", ALL_SUM)
+if (exists("run_status")) { openxlsx::addWorksheet(wb2, "Run_Status"); openxlsx::writeData(wb2, "Run_Status", run_status) }
+if (exists("yrs")) { yw <- reshape(yrs[, c("Stock", "Year", "Return")], idvar = "Stock", timevar = "Year", direction = "wide")
+  names(yw) <- sub("^Return\\.", "", names(yw)); openxlsx::addWorksheet(wb2, "Yearly_Returns"); openxlsx::writeData(wb2, "Yearly_Returns", yw) }
+for (tk in names(CMP)) { x <- CMP[[tk]]
+  openxlsx::addWorksheet(wb2, paste0("Daily_", tk))
+  openxlsx::writeData(wb2, paste0("Daily_", tk), data.frame(Date = x$days, Combined = x$comb, Baseline = x$base, BuyHold = x$bh)) }
+openxlsx::addWorksheet(wb2, "Info")
+openxlsx::writeData(wb2, "Info", data.frame(Item = c("Generated", "Combined model", "Common period", "Stocks", "Settings"),
+  Value = c(format(Sys.time(), "%Y-%m-%d %H:%M:%S"), CMP[[1]]$comb_label, paste(format(COMMON_FROM), "to", format(COMMON_TO)),
+            paste(names(CMP), collapse = ", "), "identical for every stock (see the Info sheet of each stock's own Excel file)")))
+XLSX_ALL <- file.path(OUT_DIR, "MeanReversion_AllStocks.xlsx"); openxlsx::saveWorkbook(wb2, XLSX_ALL, overwrite = TRUE); cat("Saved:", file.path(basename(OUT_DIR), basename(XLSX_ALL)))
+```
+
+```{r session}
+cat("Backtest runtime (this session):", format(difftime(Sys.time(), t_start)), "\n")
+```
