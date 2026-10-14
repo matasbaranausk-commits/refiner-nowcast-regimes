@@ -42,11 +42,11 @@ explain a refiner's stock return, and can the gap between the actual return and 
 | PSX | 2012 | -0.01 | -0.20 |
 | **Average** | | **-0.20** | **0.21** |
 
-![VLO: baseline vs regime filter](results/20_base_markov_flip.png)
+![VLO: baseline vs regime filter](Results/20_base_markov_flip.png)
 
-![Sharpe by stock](results/30_all_sharpe.png)
+![Sharpe by stock](Results/30_all_sharpe.png)
 
-![Return by calendar year](results/34_all_years.png)
+![Return by calendar year](Results/34_all_years.png)
 
 ## What I learned
 
